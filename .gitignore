@@ -1,0 +1,54 @@
+# Build trees and install output
+/build*/
+/out/
+/dist/
+/install/
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+*.spv
+*.spv.inc
+
+# Compiler and linker output
+*.obj
+*.o
+*.lib
+*.a
+*.dll
+*.so
+*.dylib
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# Local SDKs and toolchains (Qt, Vulkan, aqtinstall downloads)
+/Qt/
+/qt/
+/VulkanSDK/
+/sdk/
+/sdks/
+/third_party/downloads/
+*.7z
+
+# Logs and benchmark output
+*.log
+*.tlog
+bench*.csv
+
+# IDE and local settings
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln.docstates
+CMakeSettings.json
+.claude/
+.env
+.env.*
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store

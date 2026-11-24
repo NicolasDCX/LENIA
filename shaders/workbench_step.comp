@@ -1,0 +1,80 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// Workbench variant of lenia_step.comp (same math, lenia_math.glsl) that also stores the
+// neighborhood U and growth G(U) of `src` for display. With advance == 0 it only refreshes
+// those two fields and leaves `dst` untouched, so a paused world can be re-analyzed after a
+// kernel or growth edit without stepping.
+//
+// The node graph's environment adds env_strength * E(x, y) to the growth (lenia::step_lenia
+// with an Environment); the stored growth field includes that term. env_pattern is
+// lenia::EnvironmentPattern + 1, or 0 for no environment.
+//
+// With rule != 0 the node graph's per-cell rule (the `Rule` program, lenia_rule.glsl) gives
+// the next state instead, and the growth field shows the rule's Growth display value; the
+// growth and environment push constants are then unused.
+//
+// With u_ready != 0 the neighborhood buffer already holds U (written by fft_convolve.comp's
+// RowsInverse pass for this generation), which is used as is instead of summing the kernel.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Src { float src[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Ker { float ker[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Dst { float dst[]; };
+layout(std430, set = 0, binding = 3) buffer Neighborhood { float neighborhood[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer Growth { float growth_field[]; };
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint kwidth;
+    uint kheight;
+    float mu;
+    float sigma;
+    float dt;
+    uint advance;
+    uint growth; // lenia::GrowthFunction
+    uint env_pattern;
+    float env_strength;
+    float env_scale;
+    float env_cos;
+    float env_sin;
+    float env_offset;
+    uint rule;
+    uint u_ready;
+} p;
+
+#include "lenia_math.glsl"
+
+#define LENIA_RULE_BINDING 5
+#include "lenia_rule.glsl"
+
+void main() {
+    const uint x = gl_GlobalInvocationID.x;
+    const uint y = gl_GlobalInvocationID.y;
+    if (x >= p.width || y >= p.height) return;
+
+    const uint i = y * p.width + x;
+    float u;
+    if (p.u_ready != 0u) {
+        u = neighborhood[i];
+    } else {
+        u = lenia_neighborhood(x, y, p.width, p.height, p.kwidth, p.kheight);
+        neighborhood[i] = u;
+    }
+    if (p.rule != 0u) {
+        float g;
+        const float next = lenia_rule(x, y, p.width, p.height, src[i], u, g);
+        growth_field[i] = g;
+        if (p.advance != 0u) dst[i] = next;
+        return;
+    }
+    float g = lenia_growth(u, p.mu, p.sigma, p.growth);
+    if (p.env_pattern != 0u) {
+        g += p.env_strength * lenia_environment(p.env_pattern - 1u, x, y, p.width, p.height, p.env_scale, p.env_cos,
+                                                p.env_sin, p.env_offset);
+    }
+    growth_field[i] = g;
+    if (p.advance != 0u) dst[i] = lenia_next(src[i], g, p.dt);
+}

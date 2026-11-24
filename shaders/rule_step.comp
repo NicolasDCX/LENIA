@@ -1,0 +1,34 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// One generation of a node-graph cell rule per dispatch (lenia::VulkanStepper::step_rule):
+// the same interpreter as the workbench (lenia_rule.glsl), mirroring lenia::step_rule.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Src { float src[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Ker { float ker[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Dst { float dst[]; };
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint kwidth;
+    uint kheight;
+} p;
+
+#include "lenia_math.glsl"
+
+#define LENIA_RULE_BINDING 3
+#include "lenia_rule.glsl"
+
+void main() {
+    const uint x = gl_GlobalInvocationID.x;
+    const uint y = gl_GlobalInvocationID.y;
+    if (x >= p.width || y >= p.height) return;
+
+    const uint i = y * p.width + x;
+    const float u = lenia_neighborhood(x, y, p.width, p.height, p.kwidth, p.kheight);
+    float g;
+    dst[i] = lenia_rule(x, y, p.width, p.height, src[i], u, g);
+}

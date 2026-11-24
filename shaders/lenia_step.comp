@@ -1,0 +1,34 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// One Lenia generation per dispatch, one invocation per cell. The math lives in
+// lenia_math.glsl and mirrors lenia::step_lenia.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Src { float src[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Ker { float ker[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Dst { float dst[]; };
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint kwidth;
+    uint kheight;
+    float mu;
+    float sigma;
+    float dt;
+    uint growth; // lenia::GrowthFunction
+} p;
+
+#include "lenia_math.glsl"
+
+void main() {
+    const uint x = gl_GlobalInvocationID.x;
+    const uint y = gl_GlobalInvocationID.y;
+    if (x >= p.width || y >= p.height) return;
+
+    const float u = lenia_neighborhood(x, y, p.width, p.height, p.kwidth, p.kheight);
+    const uint i = y * p.width + x;
+    dst[i] = lenia_next(src[i], lenia_growth(u, p.mu, p.sigma, p.growth), p.dt);
+}
