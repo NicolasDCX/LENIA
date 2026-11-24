@@ -165,7 +165,8 @@ private:
     std::uint64_t gen_;
     DisplayProgram& program_;
     std::map<std::pair<int, int>, std::uint32_t> memo_;
-    std::array<std::uint32_t, kDisplayFieldCount> fields_{kNoDisplayRegister, kNoDisplayRegister, kNoDisplayRegister};
+    std::array<std::uint32_t, kDisplayFieldCount> fields_{kNoDisplayRegister, kNoDisplayRegister, kNoDisplayRegister,
+                                                          kNoDisplayRegister};
     std::uint32_t black_ = kNoDisplayRegister;
 };
 
@@ -265,7 +266,8 @@ DisplayCompile compile_display(const Graph& graph, std::uint64_t generation) {
     return result;
 }
 
-std::array<float, 4> run_display(const DisplayProgram& program, float density, float neighborhood, float growth) {
+std::array<float, 4> run_display(const DisplayProgram& program, float density, float neighborhood, float growth,
+                                 float nutrient) {
     std::array<Rgba, kMaxDisplayOps> r{};
     const std::size_t count = std::min(program.ops.size(), kMaxDisplayOps);
     const std::size_t stop_count = std::min(program.stops.size(), kMaxDisplayStops);
@@ -277,7 +279,7 @@ std::array<float, 4> run_display(const DisplayProgram& program, float density, f
         switch (static_cast<Op>(o.op)) {
         case Op::Const: v = {o.k[0], o.k[1], o.k[2], o.k[3]}; break;
         case Op::Field: {
-            const float f = o.m0 == 0u ? density : (o.m0 == 1u ? neighborhood : growth);
+            const float f = o.m0 == 0u ? density : (o.m0 == 1u ? neighborhood : (o.m0 == 2u ? growth : nutrient));
             v = {f, f, f, 1.0f};
             break;
         }
@@ -354,6 +356,27 @@ bool wire_panel_display(Graph& g, DisplayField field, const DisplayRange& range)
 
 Graph make_display_preset(DisplayPreset preset, DisplayField field, const DisplayRange& range) {
     Graph g(GraphDomain::Display);
+    if (preset == DisplayPreset::DensityNutrient) {
+        // Nutrient as soil (dark brown depleted, green full); the density, black at 0, screened
+        // over it, so empty cells show the soil unchanged.
+        const int fields = g.add_node(NodeKind::Fields, 20, 120);
+        const int soil = g.add_node(NodeKind::ColorRamp, 290, 0);
+        set_ramp_stops(g, soil,
+                       {{0.0f, {0.08f, 0.05f, 0.03f}}, {0.5f, {0.3f, 0.24f, 0.08f}}, {1.0f, {0.1f, 0.36f, 0.16f}}});
+        const int creature = g.add_node(NodeKind::ColorRamp, 290, 170);
+        set_ramp_stops(g, creature,
+                       {{0.0f, {0.0f, 0.0f, 0.0f}}, {0.3f, {0.15f, 0.55f, 0.95f}}, {1.0f, {1.0f, 0.97f, 0.85f}}});
+        const int mix = g.add_node(NodeKind::Mix, 560, 100);
+        g.set_param(mix, mix_node::Mode, static_cast<float>(mix_node::Screen));
+        g.set_param(mix, mix_node::Factor, 1.0f);
+        const int view = g.add_node(NodeKind::View, 830, 120);
+        g.connect(fields, fields_node::NutrientOut, soil, ramp_node::ValueIn);
+        g.connect(fields, fields_node::DensityOut, creature, ramp_node::ValueIn);
+        g.connect(soil, 0, mix, mix_node::AIn);
+        g.connect(creature, 0, mix, mix_node::BIn);
+        g.connect(mix, 0, view, view_node::ColorIn);
+        return g;
+    }
     if (preset != DisplayPreset::GrowthOverlay) {
         g.add_node(NodeKind::View, 560, 40);
         if (preset == DisplayPreset::WiredPanel) wire_panel_display(g, field, range);

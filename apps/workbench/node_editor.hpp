@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 class QComboBox;
 class QFormLayout;
@@ -20,7 +21,8 @@ namespace workbench {
 // Interactive canvas for a lenia::Graph (owned elsewhere), simulation or display. Nodes show
 // their live values at the current generation, and the Oscillator, Kernel, Environment,
 // Growth, Life and Simulation nodes draw previews (wave, warped radial profile, environment
-// field, growth curve, rule), as do the display's Color ramp, Color and View nodes.
+// field, growth curve, rule), as do Kernel K (its weights) and Convolve (whether the rule uses
+// it) and the display's Color ramp, Color and View nodes.
 //
 // Mouse: drag from a port to a port of the same type to link (a Value output also links into
 // a cell input; an input takes one link, a new one replaces it); drag a linked input away to
@@ -41,15 +43,26 @@ public:
     // Wires the built-in Lenia update as nodes (lenia::wire_lenia_rule) if Next state is unlinked.
     void wire_lenia_rule();
 
+    // Widget coordinates of a port and of a node's title bar, for driving the canvas with mouse
+    // events (tests); a null point if the node does not exist.
+    QPointF port_widget_pos(int node, int port, bool output) const;
+    QPointF title_widget_pos(int node) const;
+
     int selected_node() const { return selected_node_; }
     void select_node(int id);
     void add_node(lenia::NodeKind kind); // near the middle of the visible area
     void frame_all();
     // The graph was replaced wholesale (a preset): drops the selection and frames it.
     void graph_replaced();
+    // The graph was set back to an earlier state (undo / redo): keeps the view and the
+    // selection where they still exist, cancels a drag in progress.
+    void graph_restored();
 
 signals:
     void graph_changed(); // nodes or links changed (positions do not count)
+    // A gesture that may have changed the graph ended (link drag released, node moved, menu
+    // command done): one undo step named `text` (EditHistory::commit, docs/undo.md).
+    void edited(const QString& text, const QString& merge_key = QString());
     void selection_changed(int node);
     void message(const QString& text);
     // Display graphs: "Wire the panel display as nodes" on an unlinked View node. The owner
@@ -87,6 +100,8 @@ private:
     void draw_node(QPainter& p, const lenia::Node& n);
     void draw_oscillator_preview(QPainter& p, const lenia::Node& n, QRectF area);
     void draw_kernel_preview(QPainter& p, const lenia::Node& n, QRectF area);
+    void draw_conv_kernel_preview(QPainter& p, const lenia::Node& n, QRectF area);
+    void draw_convolve_preview(QPainter& p, const lenia::Node& n, QRectF area);
     void draw_environment_preview(QPainter& p, const lenia::Node& n, QRectF area);
     void draw_growth_preview(QPainter& p, const lenia::Node& n, QRectF area);
     void draw_life_preview(QPainter& p, const lenia::Node& n, QRectF area);
@@ -121,6 +136,10 @@ private:
     QPointF move_offset_;
     QPointF last_mouse_; // widget
     PortRef hover_port_;
+    // Link drags that picked up a linked input: the graph before, and the link picked up, so
+    // dropping it back where it was restores the graph exactly (no undo step).
+    std::optional<lenia::Graph> link_drag_before_;
+    std::optional<lenia::Link> detached_;
 };
 
 // NodeCanvas with a toolbar (add nodes, example graphs, frame) and an inspector for the
@@ -135,9 +154,14 @@ public:
     NodeCanvas* canvas() const { return canvas_; }
     // Replaces the graph with the preset (graph only; simulation graphs).
     void load_preset(lenia::GraphPreset preset);
+    // The selected node's parameter editor for parameter `index`, if shown (tests).
+    QWidget* inspector_field(int index) const;
 
 signals:
     void graph_changed();
+    // Canvas gestures and inspector edits, as NodeCanvas::edited. Spin box steps on one field
+    // share a merge key until the field loses focus, so they are one undo step.
+    void edited(const QString& text, const QString& merge_key = QString());
     void message(const QString& text);
     // The Example "Load" button: the owner decides what a preset needs besides the graph (the
     // Game of Life its kernel and seed) and calls load_preset for graph-only ones.
@@ -157,6 +181,8 @@ private:
     QWidget* inspector_fields_;
     QFormLayout* inspector_form_;
     QPushButton* delete_node_;
+    std::vector<QWidget*> inspector_fields_by_param_; // index: parameter; null if not shown
+    int inspector_session_ = 0; // part of the spin boxes' merge keys; bumped when one loses focus
 };
 
 } // namespace workbench

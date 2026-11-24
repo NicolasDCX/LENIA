@@ -7,7 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(lenia_core src/convolve.cpp src/step.cpp src/kernel.cpp src/kernel_shape.cpp src/pattern.cpp
                        src/environment.cpp src/node_graph.cpp src/project.cpp src/rule.cpp src/display_graph.cpp
-                       src/snapshot.cpp src/fft_convolve.cpp)
+                       src/snapshot.cpp src/fft_convolve.cpp src/world.cpp)
 target_include_directories(lenia_core PUBLIC include)
 
 enable_testing()
@@ -51,6 +51,17 @@ add_executable(test_rule tests/test_rule.cpp)
 target_link_libraries(test_rule PRIVATE lenia_core)
 target_compile_definitions(test_rule PRIVATE LENIA_PATTERN_DIR="${LENIA_PATTERN_DIR}")
 add_test(NAME rule COMMAND test_rule)
+
+# Two state fields (Density + Nutrient): seeding, simultaneous update, the trail demo, files.
+add_executable(test_state_fields tests/test_state_fields.cpp)
+target_link_libraries(test_state_fields PRIVATE lenia_core)
+target_compile_definitions(test_state_fields PRIVATE LENIA_PATTERN_DIR="${LENIA_PATTERN_DIR}")
+add_test(NAME state_fields COMMAND test_state_fields)
+
+# Reusable kernels: Kernel K and Convolve(Field, Kernel) nodes, independent kernels per field.
+add_executable(test_convolve_node tests/test_convolve_node.cpp)
+target_link_libraries(test_convolve_node PRIVATE lenia_core)
+add_test(NAME convolve_node COMMAND test_convolve_node)
 
 add_executable(test_display_graph tests/test_display_graph.cpp)
 target_link_libraries(test_display_graph PRIVATE lenia_core)
@@ -142,6 +153,8 @@ if(LENIA_BUILD_WORKBENCH)
     set(LENIA_WORKBENCH_SOURCES
         apps/workbench/main_window.cpp
         apps/workbench/main_window.hpp
+        apps/workbench/edit_history.cpp
+        apps/workbench/edit_history.hpp
         apps/workbench/lenia_view.cpp
         apps/workbench/lenia_view.hpp
         apps/workbench/kernel_editor.cpp
@@ -192,9 +205,28 @@ if(LENIA_BUILD_WORKBENCH)
     add_dependencies(test_workbench_smoke lenia_workbench)
     add_test(NAME workbench_smoke COMMAND test_workbench_smoke)
     set_tests_properties(workbench_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 LABELS gui)
+    # Undo / redo in the real window (docs/undo.md): mouse gestures on the node canvases and the
+    # kernel canvas, inspector and panel edits, Edit menu state, Ctrl+Z from the viewport, and
+    # that undo never touches the world, its generation or play / pause. Same requirements.
+    add_executable(test_workbench_undo tests/test_workbench_undo.cpp)
+    lenia_add_workbench_sources(test_workbench_undo lenia_patterns_undo)
+    target_compile_definitions(test_workbench_undo PRIVATE LENIA_PATTERN_DIR="${LENIA_PATTERN_DIR}")
+    add_dependencies(test_workbench_undo lenia_workbench)
+    add_test(NAME workbench_undo COMMAND test_workbench_undo)
+    set_tests_properties(workbench_undo PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 LABELS gui)
+
+    # The undo history's checkpoint, merge and reset rules on their own: no window, no Vulkan.
+    add_executable(test_edit_history tests/test_edit_history.cpp apps/workbench/edit_history.cpp
+                                     apps/workbench/edit_history.hpp)
+    set_target_properties(test_edit_history PROPERTIES AUTOMOC ON)
+    target_include_directories(test_edit_history PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps/workbench)
+    target_link_libraries(test_edit_history PRIVATE lenia_core Qt6::Gui)
+    add_dependencies(test_edit_history lenia_workbench)
+    add_test(NAME edit_history COMMAND test_edit_history)
+
     if(WIN32)
         # Without windeployqt (LENIA_WORKBENCH_DEPLOY=OFF) the Qt DLLs come from the kit.
-        set_tests_properties(workbench_smoke PROPERTIES
+        set_tests_properties(workbench_smoke workbench_undo edit_history PROPERTIES
             ENVIRONMENT_MODIFICATION "PATH=path_list_append:$<TARGET_FILE_DIR:Qt6::Core>")
     endif()
 

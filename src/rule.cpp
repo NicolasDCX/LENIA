@@ -16,11 +16,48 @@ namespace {
 
 using Op = RuleOpCode;
 
+// A rule that cannot run, with the message compile_rule reports.
+struct CompileError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+// make_conv_kernel, remembering the last few kernels: compile_rule runs before every generation,
+// and rebuilding a 65 x 65 kernel each time would cost more than the rest of the compile.
+Grid cached_conv_kernel(const ConvKernel& k) {
+    struct Entry {
+        ConvKernel key;
+        Grid kernel;
+    };
+    constexpr std::size_t kEntries = 2 * kMaxConvolutions;
+    thread_local std::vector<Entry> cache; // most recently used last
+    const auto it = std::find_if(cache.begin(), cache.end(), [&](const Entry& e) { return e.key == k; });
+    if (it != cache.end()) {
+        std::rotate(it, it + 1, cache.end());
+        return cache.back().kernel;
+    }
+    Grid kernel = make_conv_kernel(k); // throws std::invalid_argument
+    if (cache.size() >= kEntries) cache.erase(cache.begin());
+    cache.push_back({k, kernel});
+    return kernel;
+}
+
+// The field each of program.kernels is convolved with (0 density, 1 nutrient), from its ops.
+std::vector<std::uint32_t> kernel_fields(const RuleProgram& program) {
+    std::vector<std::uint32_t> fields(program.kernels.size(), 0u);
+    for (const RuleOp& o : program.ops) {
+        if (o.op == static_cast<std::uint32_t>(Op::Convolve) && o.m0 < fields.size()) fields[o.m0] = o.m1;
+    }
+    return fields;
+}
+
 // Emits ops for the nodes upstream of a cell input, depth first, each node output once.
 class Compiler {
 public:
     Compiler(const Graph& g, std::uint64_t gen, const GrowthParams& panel, RuleProgram& program)
         : g_(g), gen_(gen), panel_(panel), program_(program) {}
+
+    // Convolve node id -> the register holding its U, in compile order.
+    const std::vector<std::pair<int, std::uint32_t>>& convolve_registers() const { return convolve_registers_; }
 
     // Register holding the value of input `port` of `n`: its link, or `fallback()` if unlinked.
     template <class Fallback> std::uint32_t input(const Node& n, int port, Fallback fallback, int depth) {
@@ -74,6 +111,65 @@ private:
         return neighborhood_;
     }
 
+    std::uint32_t nutrient() {
+        if (nutrient_ == kNoRegister) nutrient_ = simple(Op::Nutrient);
+        return nutrient_;
+    }
+
+    // U = K ∗ field for Convolve node `n`: one convolution per distinct (field, kernel) pair,
+    // shared by every Convolve node that asks for the same one.
+    std::uint32_t convolve(const Node& n) {
+        const std::string name = "Convolve node " + std::to_string(n.id);
+        std::uint32_t field = 0; // unlinked: the density
+        if (const Link* l = g_.link_into(n.id, convolve_node::FieldIn)) {
+            field = g_.node(l->from_node)->kind == NodeKind::Nutrient ? 1u : 0u;
+        }
+        const Link* kl = g_.link_into(n.id, convolve_node::KernelIn);
+        if (!kl) throw CompileError(name + " has no Kernel K linked into its Kernel input");
+        Grid kernel;
+        try {
+            kernel = cached_conv_kernel(node_conv_kernel(g_, kl->from_node));
+        } catch (const std::invalid_argument& e) {
+            throw CompileError("Kernel K node " + std::to_string(kl->from_node) + ": " + e.what());
+        }
+
+        std::size_t index = 0;
+        while (index < program_.kernels.size() &&
+               !(fields_[index] == field && program_.kernels[index] == kernel)) {
+            ++index;
+        }
+        if (index == program_.kernels.size()) {
+            if (program_.kernels.size() >= kMaxConvolutions) {
+                throw CompileError("the rule needs more than " + std::to_string(kMaxConvolutions) +
+                                   " different convolutions (Convolve nodes with the same field and equal kernels "
+                                   "share one); remove a Convolve node or reuse a Kernel K");
+            }
+            std::size_t weights = kernel.cells.size();
+            for (const Grid& k : program_.kernels) weights += k.cells.size();
+            if (weights > kMaxConvolveWeights) {
+                throw CompileError("the rule's Convolve kernels hold more than " +
+                                   std::to_string(kMaxConvolveWeights) + " weights together; make them smaller");
+            }
+            program_.kernels.push_back(std::move(kernel));
+            fields_.push_back(field);
+        }
+        if (const auto it = convolution_registers_.find(index); it != convolution_registers_.end()) {
+            return it->second;
+        }
+        std::uint32_t offset = 0;
+        for (std::size_t i = 0; i < index; ++i) offset += static_cast<std::uint32_t>(program_.kernels[i].cells.size());
+        RuleOp op;
+        op.op = static_cast<std::uint32_t>(Op::Convolve);
+        op.a = offset;
+        op.b = static_cast<std::uint32_t>(program_.kernels[index].width);
+        op.c = static_cast<std::uint32_t>(program_.kernels[index].height);
+        op.m0 = static_cast<std::uint32_t>(index);
+        op.m1 = field;
+        const std::uint32_t reg = emit(op);
+        convolution_registers_[index] = reg;
+        return reg;
+    }
+
     std::uint32_t output(const Node& n, int port, int depth) {
         // Every node on a chain emits at least one op, so a longer chain cannot fit anyway.
         if (depth > static_cast<int>(kMaxRuleOps)) throw std::length_error("chain too long");
@@ -89,6 +185,13 @@ private:
             break;
         case NodeKind::Neighborhood:
             reg = neighborhood();
+            break;
+        case NodeKind::Nutrient:
+            reg = nutrient();
+            break;
+        case NodeKind::Convolve:
+            reg = convolve(n);
+            convolve_registers_.emplace_back(n.id, reg);
             break;
         case NodeKind::Environment: {
             const Environment e = node_environment(g_, n.id, gen_);
@@ -179,6 +282,10 @@ private:
     std::map<std::pair<int, int>, std::uint32_t> memo_;
     std::uint32_t density_ = kNoRegister;
     std::uint32_t neighborhood_ = kNoRegister;
+    std::uint32_t nutrient_ = kNoRegister;
+    std::vector<std::uint32_t> fields_; // the field of each of program_.kernels
+    std::map<std::size_t, std::uint32_t> convolution_registers_; // kernels index -> its Convolve op
+    std::vector<std::pair<int, std::uint32_t>> convolve_registers_;
 };
 
 bool compare(std::uint32_t op, float a, float b) {
@@ -200,22 +307,38 @@ float finite_or_zero(float v) { return std::isfinite(v) ? v : 0.0f; }
 RuleCompile compile_rule(const Graph& graph, std::uint64_t generation, const GrowthParams& panel) {
     RuleCompile result;
     const Node* out = graph.node(graph.output_node());
-    if (!out || !graph.link_into(out->id, output_node::NextIn)) return result;
+    if (!out || graph.domain() != GraphDomain::Simulation) return result;
+    const bool next = graph.link_into(out->id, output_node::NextIn) != nullptr;
+    const bool nutrient = graph.link_into(out->id, output_node::NutrientIn) != nullptr;
+    if (!next && !nutrient) return result;
     result.linked = true;
+    if (!next) {
+        result.error = "Next nutrient is linked but Next state is not: link the density's rule into Next state "
+                       "too (select the Simulation node to wire the Lenia rule)";
+        return result;
+    }
     Compiler compiler(graph, generation, panel, result.program);
     try {
         result.program.output =
             compiler.input(*out, output_node::NextIn, [] { return kNoRegister; }, 0);
+        if (nutrient) {
+            result.program.nutrient = compiler.input(*out, output_node::NutrientIn, [] { return kNoRegister; }, 0);
+        }
+        result.convolve_registers = compiler.convolve_registers();
     } catch (const std::length_error&) {
         result.program = {};
         result.error = "the rule needs more than " + std::to_string(kMaxRuleOps) +
                        " operations (each node, constant and unlinked input parameter counts); simplify it";
+    } catch (const CompileError& e) {
+        result.program = {};
+        result.error = e.what();
     }
     return result;
 }
 
-float run_rule(const RuleProgram& program, float density, float neighborhood, std::size_t x, std::size_t y,
-               std::size_t width, std::size_t height, float* growth_display) {
+RuleResult run_rule(const RuleProgram& program, const RuleCell& cell, std::size_t x, std::size_t y,
+                    std::size_t width, std::size_t height) {
+    const float density = cell.density;
     std::array<float, kMaxRuleOps> r{};
     const std::size_t count = std::min(program.ops.size(), kMaxRuleOps);
     for (std::size_t i = 0; i < count; ++i) {
@@ -226,7 +349,9 @@ float run_rule(const RuleProgram& program, float density, float neighborhood, st
         switch (static_cast<Op>(o.op)) {
         case Op::Const: v = o.k[0]; break;
         case Op::Density: v = density; break;
-        case Op::Neighborhood: v = neighborhood; break;
+        case Op::Neighborhood: v = cell.neighborhood; break;
+        case Op::Nutrient: v = cell.nutrient; break;
+        case Op::Convolve: v = o.m0 < kMaxConvolutions ? cell.convolved[o.m0] : 0.0f; break;
         case Op::Growth: {
             GrowthParams g;
             g.mu = reg(o.b);
@@ -259,38 +384,97 @@ float run_rule(const RuleProgram& program, float density, float neighborhood, st
         }
         r[i] = v;
     }
-    const float next = finite_or_zero(program.output < count ? r[program.output] : density);
-    if (growth_display) {
-        *growth_display = finite_or_zero(program.growth < count ? r[program.growth] : next - density);
-    }
-    return next;
+    RuleResult out;
+    out.density = finite_or_zero(program.output < count ? r[program.output] : density);
+    out.nutrient = finite_or_zero(program.nutrient < count ? r[program.nutrient] : cell.nutrient);
+    out.growth = finite_or_zero(program.growth < count ? r[program.growth] : out.density - density);
+    return out;
 }
 
+float run_rule(const RuleProgram& program, float density, float neighborhood, std::size_t x, std::size_t y,
+               std::size_t width, std::size_t height, float* growth_display) {
+    const RuleResult r = run_rule(program, RuleCell{density, 0.0f, neighborhood}, x, y, width, height);
+    if (growth_display) *growth_display = r.growth;
+    return r.density;
+}
+
+namespace {
+// Each Convolve kernel convolved with its field; `nutrient` null reads a nutrient of 0.
+std::vector<Grid> convolutions(const RuleProgram& program, const Grid& density, const Grid* nutrient) {
+    const std::vector<std::uint32_t> fields = kernel_fields(program);
+    std::vector<Grid> out;
+    const std::size_t count = std::min(program.kernels.size(), kMaxConvolutions);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (fields[i] == 1u && !nutrient) out.emplace_back(density.width, density.height, 0.0f);
+        else out.push_back(convolve(fields[i] == 1u ? *nutrient : density, program.kernels[i]));
+    }
+    return out;
+}
+
+RuleCell rule_cell(const std::vector<Grid>& convolved, std::size_t i, float density, float nutrient, float u) {
+    RuleCell cell{density, nutrient, u};
+    for (std::size_t k = 0; k < convolved.size(); ++k) cell.convolved[k] = convolved[k].cells[i];
+    return cell;
+}
+} // namespace
+
 Grid step_rule(const Grid& world, const Grid& kernel, const RuleProgram& program) {
+    const std::vector<Grid> convolved = convolutions(program, world, nullptr);
     Grid next = convolve(world, kernel); // holds U, overwritten in place below
     for (std::size_t y = 0; y < next.height; ++y) {
         for (std::size_t x = 0; x < next.width; ++x) {
             const std::size_t i = y * next.width + x;
-            next.cells[i] = run_rule(program, world.cells[i], next.cells[i], x, y, next.width, next.height);
+            next.cells[i] = run_rule(program, rule_cell(convolved, i, world.cells[i], 0.0f, next.cells[i]), x, y,
+                                     next.width, next.height)
+                                .density;
         }
     }
     return next;
 }
 
-std::vector<std::uint32_t> pack_rule(const RuleProgram& program) {
+WorldState step_rule(const WorldState& world, const Grid& kernel, const RuleProgram& program) {
+    const Grid& a = world.density;
+    if (world.nutrient.width != a.width || world.nutrient.height != a.height ||
+        world.nutrient.cells.size() != a.cells.size()) {
+        throw std::invalid_argument("step_rule: the nutrient and density fields differ in size");
+    }
+    const Grid u = convolve(a, kernel);
+    const std::vector<Grid> convolved = convolutions(program, a, &world.nutrient);
+    // Fresh grids for the results: every cell reads only the current state.
+    WorldState next{Grid(a.width, a.height), Grid(a.width, a.height)};
+    for (std::size_t y = 0; y < a.height; ++y) {
+        for (std::size_t x = 0; x < a.width; ++x) {
+            const std::size_t i = y * a.width + x;
+            const RuleResult r = run_rule(program, rule_cell(convolved, i, a.cells[i], world.nutrient.cells[i], u.cells[i]),
+                                          x, y, a.width, a.height);
+            next.density.cells[i] = r.density;
+            next.nutrient.cells[i] = r.nutrient;
+        }
+    }
+    return next;
+}
+
+std::vector<std::uint32_t> pack_rule(const RuleProgram& program, std::uint32_t kernel_base) {
     std::vector<std::uint32_t> words;
     const std::size_t count = std::min(program.ops.size(), kMaxRuleOps);
     words.reserve(4 + 12 * count);
     words.push_back(static_cast<std::uint32_t>(count));
     words.push_back(program.output);
     words.push_back(program.growth);
-    words.push_back(0u);
+    words.push_back(program.nutrient);
     for (std::size_t i = 0; i < count; ++i) {
         const RuleOp& o = program.ops[i];
-        for (std::uint32_t w : {o.op, o.a, o.b, o.c, o.m0, o.m1}) words.push_back(w);
+        const std::uint32_t a = o.op == static_cast<std::uint32_t>(Op::Convolve) ? o.a + kernel_base : o.a;
+        for (std::uint32_t w : {o.op, a, o.b, o.c, o.m0, o.m1}) words.push_back(w);
         for (float k : o.k) words.push_back(std::bit_cast<std::uint32_t>(k));
     }
     return words;
+}
+
+std::vector<float> pack_rule_kernels(const RuleProgram& program) {
+    std::vector<float> weights;
+    for (const Grid& k : program.kernels) weights.insert(weights.end(), k.cells.begin(), k.cells.end());
+    return weights;
 }
 
 Grid moore_kernel() {

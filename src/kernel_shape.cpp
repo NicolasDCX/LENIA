@@ -96,6 +96,35 @@ Grid make_kernel(const KernelShape& shape, const KernelWarp& warp) {
     return kernel;
 }
 
+Grid make_kernel(const KernelShape& shape, float shift_x, float shift_y) {
+    if (shape.radius < 1) {
+        throw std::invalid_argument("kernel radius must be at least 1");
+    }
+    if (shape.rings.empty()) {
+        throw std::invalid_argument("kernel shape needs at least one ring");
+    }
+    if (!std::isfinite(shift_x) || !std::isfinite(shift_y)) {
+        throw std::invalid_argument("kernel shift must be finite");
+    }
+    const double sx = shift_x, sy = shift_y;
+    // Cells at distance >= radius from the ring center are 0.
+    const long long half =
+        static_cast<long long>(std::ceil(shape.radius + std::max(std::fabs(sx), std::fabs(sy)) - 1e-9));
+    const std::size_t size = static_cast<std::size_t>(2 * half + 1);
+    Grid kernel(size, size, 0.0f);
+    for (long long y = -half; y <= half; ++y) {
+        for (long long x = -half; x <= half; ++x) {
+            // The ring center is at (-sx, -sy); unshifted this is make_kernel's distance exactly.
+            const double dx = static_cast<double>(x) + sx;
+            const double dy = static_cast<double>(y) + sy;
+            const float r = static_cast<float>(std::sqrt(dx * dx + dy * dy) / shape.radius);
+            kernel.at(static_cast<std::size_t>(x + half), static_cast<std::size_t>(y + half)) =
+                kernel_shell(shape, r);
+        }
+    }
+    return kernel;
+}
+
 KernelStats kernel_stats(const Grid& kernel) {
     KernelStats s;
     for (float w : kernel.cells) {

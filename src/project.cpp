@@ -33,16 +33,26 @@ const std::vector<std::string> kCoreNames = {"exponential", "polynomial", "step"
 const std::vector<std::string> kNormalizationNames = {"none", "sum", "positive", "abs_sum"};
 const std::vector<std::string> kGrowthNames = {"gaussian", "polynomial"};
 const std::vector<std::string> kSeedNames = {"random", "pattern", "impulse", "empty"};
-const std::vector<std::string> kFieldNames = {"density", "neighborhood", "growth"};
+const std::vector<std::string> kFieldNames = {"density", "neighborhood", "growth", "nutrient"};
 const std::vector<std::string> kPaletteNames = {"grayscale", "viridis", "inferno", "redblue", "icefire"};
 const std::vector<std::string> kKindNames = {"time",     "oscillator", "constant", "kernel",  "environment",
                                              "output",   "density",    "neighborhood", "growth", "add",
                                              "multiply", "clamp",      "compare",  "select",  "life",
-                                             "fields",   "ramp",       "color",    "mix",     "view"};
+                                             "fields",   "ramp",       "color",    "mix",     "view",
+                                             "nutrient", "conv_kernel", "convolve"};
+const std::vector<std::string> kNutrientStartNames = {"uniform", "random", "gradient"};
 // Version 1 knew only the first six kinds, and fewer ports on the Environment and Output nodes.
 constexpr std::size_t kVersion1Kinds = 6;
 // Display graphs ([display_graph]) arrived with version 3.
 constexpr int kDisplayGraphVersion = 3;
+// The nutrient field ([nutrient], the nutrient kind, display field and ports) with version 4.
+constexpr int kNutrientVersion = 4;
+constexpr std::size_t kPreNutrientKinds = 20;
+constexpr std::size_t kPreNutrientFields = 3;
+// Reusable kernels (the conv_kernel and convolve kinds) with version 5. The Field outputs of
+// Density A and Nutrient N link only into Convolve nodes, so they need no check of their own.
+constexpr int kConvolveVersion = 5;
+constexpr std::size_t kPreConvolveKinds = 21;
 
 template <class E> const std::string& name_of(const std::vector<std::string>& names, E value) {
     return names.at(static_cast<std::size_t>(value));
@@ -182,6 +192,10 @@ public:
                 parse_graph(h, p.display_graph, "display_graph");
             } else if (name == "display_graph") {
                 fail(h.number, "[display_graph] needs format version " + std::to_string(kDisplayGraphVersion));
+            } else if (name == "nutrient" && version_ >= kNutrientVersion) {
+                parse_nutrient(h, p);
+            } else if (name == "nutrient") {
+                fail(h.number, "[nutrient] needs format version " + std::to_string(kNutrientVersion));
             } else {
                 fail(h.number, "unknown section [" + name + "]");
             }
@@ -191,6 +205,8 @@ public:
         }
         // Older files have no display graph: the default (a lone View node) shows the panel display.
         if (version_ >= kDisplayGraphVersion && !seen.count("display_graph")) fail("missing section [display_graph]");
+        // Older files: a uniform nutrient of 1, which their graphs cannot read.
+        if (version_ >= kNutrientVersion && !seen.count("nutrient")) fail("missing section [nutrient]");
         if (p.paint.width != 0 && p.paint.width != static_cast<std::size_t>(2 * p.kernel.radius + 1)) {
             fail("kernel paint is " + std::to_string(p.paint.width) + " cells wide; radius " +
                  std::to_string(p.kernel.radius) + " needs " + std::to_string(2 * p.kernel.radius + 1));
@@ -333,6 +349,17 @@ private:
         p.random_seed = parse_int(random, random.tokens[1], 0, 2147483647);
     }
 
+    void parse_nutrient(const Line& header, Project& p) {
+        const Section s = read_section(header, "nutrient", {"start", "level"});
+        const Line& start = s.get("start", "nutrient");
+        expect_values(start, 1);
+        p.nutrient.start = static_cast<NutrientStart>(parse_choice(start, start.tokens[1], kNutrientStartNames));
+        const Line& level = s.get("level", "nutrient");
+        expect_values(level, 1);
+        p.nutrient.level = parse_float(level, level.tokens[1]);
+        if (p.nutrient.level < 0.0f || p.nutrient.level > 1.0f) fail(level.number, "level must be within [0, 1]");
+    }
+
     void parse_pattern_section(const Line& header, Project& p) {
         const Section s = read_section(header, "pattern", {"name", "source", "license", "cells"}, {"cells"});
         Pattern pattern;
@@ -346,14 +373,19 @@ private:
     }
 
     void parse_display(const Line& header, Project& p) {
-        std::set<std::string> keys(kFieldNames.begin(), kFieldNames.end());
+        // Older versions have no nutrient field (its range keeps the default).
+        const std::vector<std::string> names(
+            kFieldNames.begin(), kFieldNames.begin() + static_cast<std::ptrdiff_t>(
+                                                           version_ >= kNutrientVersion ? kFieldNames.size()
+                                                                                        : kPreNutrientFields));
+        std::set<std::string> keys(names.begin(), names.end());
         keys.insert("field");
         const Section s = read_section(header, "display", keys);
         const Line& field = s.get("field", "display");
         expect_values(field, 1);
-        p.field = static_cast<DisplayField>(parse_choice(field, field.tokens[1], kFieldNames));
-        for (std::size_t i = 0; i < kFieldNames.size(); ++i) {
-            const Line& l = s.get(kFieldNames[i], "display");
+        p.field = static_cast<DisplayField>(parse_choice(field, field.tokens[1], names));
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            const Line& l = s.get(names[i], "display");
             expect_values(l, 3);
             DisplayRange& r = p.display[i];
             r.palette = static_cast<DisplayPalette>(parse_choice(l, l.tokens[1], kPaletteNames));
@@ -382,6 +414,14 @@ private:
                 if (version_ < 2 && static_cast<std::size_t>(kind) >= kVersion1Kinds) {
                     fail(l.number, "node kind '" + l.tokens[2] + "' needs format version 2");
                 }
+                if (version_ < kNutrientVersion && static_cast<std::size_t>(kind) >= kPreNutrientKinds) {
+                    fail(l.number, "node kind '" + l.tokens[2] + "' needs format version " +
+                                       std::to_string(kNutrientVersion));
+                }
+                if (version_ < kConvolveVersion && static_cast<std::size_t>(kind) >= kPreConvolveKinds) {
+                    fail(l.number, "node kind '" + l.tokens[2] + "' needs format version " +
+                                       std::to_string(kConvolveVersion));
+                }
                 n.kind = static_cast<NodeKind>(kind);
                 n.x = parse_float(l, l.tokens[3]);
                 n.y = parse_float(l, l.tokens[4]);
@@ -402,6 +442,20 @@ private:
         }
         const std::string error = graph.assign(nodes, links);
         if (!error.empty()) fail(header.number, "[" + section + "]: " + error);
+        if (version_ < kNutrientVersion) {
+            for (const Link& k : graph.links()) {
+                const NodeKind from = graph.node(k.from_node)->kind;
+                const bool next_nutrient = !display && k.to_node == graph.output_node() &&
+                                           k.to_port == output_node::NutrientIn;
+                const bool nutrient_field = from == NodeKind::Fields && k.from_port == fields_node::NutrientOut;
+                if (next_nutrient || nutrient_field) {
+                    fail(header.number, "[" + section + "]: link " + std::to_string(k.from_node) + ":" +
+                                            std::to_string(k.from_port) + " -> " + std::to_string(k.to_node) + ":" +
+                                            std::to_string(k.to_port) + " needs format version " +
+                                            std::to_string(kNutrientVersion));
+                }
+            }
+        }
         if (version_ < 2 && !display) {
             for (const Link& k : graph.links()) {
                 const bool field = graph.node(k.from_node)->kind == NodeKind::Environment &&
@@ -447,6 +501,11 @@ std::string write_project(const Project& p) {
         << "size " << p.world_size << '\n'
         << "seed " << name_of(kSeedNames, p.seed) << '\n'
         << "random_seed " << p.random_seed << '\n';
+
+    out << "\n[nutrient]\n"
+        << "# the second state field's start: uniform, random (from the world's random_seed) or gradient\n"
+        << "start " << name_of(kNutrientStartNames, p.nutrient.start) << '\n'
+        << "level " << num(p.nutrient.level) << '\n';
 
     if (p.pattern) {
         out << "\n[pattern]\n";
@@ -495,5 +554,44 @@ Project make_life_project(GraphPreset preset) {
     p.graph = make_preset(is_life_preset(preset) ? preset : GraphPreset::GameOfLife);
     return p;
 }
+
+Project make_nutrient_trail_project(const Pattern& creature) {
+    Project p;
+    p.kernel = creature.kernel;
+    p.growth = creature.growth;
+    p.world_size = 256;
+    p.seed = SeedKind::Pattern;
+    p.pattern = creature;
+    p.nutrient = {NutrientStart::Uniform, 1.0f};
+    p.field = DisplayField::Nutrient;
+    p.display[0] = {DisplayPalette::Viridis, 0.0f, 1.0f};
+    p.display[1] = {DisplayPalette::Inferno, 0.0f, 0.3f};
+    p.display[2] = {DisplayPalette::RedBlue, -1.0f, 1.0f};
+    p.display[3] = {DisplayPalette::Inferno, 0.0f, 1.0f};
+    p.graph = make_preset(GraphPreset::NutrientTrail);
+    p.display_graph = make_display_preset(DisplayPreset::DensityNutrient);
+    return p;
+}
+
+Project make_short_long_project() {
+    Project p;
+    // The rule reads no Neighborhood U; the panel's kernel only feeds the Neighborhood view
+    // until a Convolve node is selected for preview.
+    p.kernel.radius = kShortRadius;
+    p.kernel.core = KernelCore::GaussianBell;
+    p.kernel.rings = {1.0f};
+    p.normalization = KernelNormalization::Sum;
+    p.world_size = 256;
+    p.seed = SeedKind::Random;
+    p.random_seed = 1;
+    p.field = DisplayField::Density;
+    p.display[0] = {DisplayPalette::Viridis, 0.0f, 1.0f};
+    p.display[1] = {DisplayPalette::Inferno, 0.0f, 1.0f}; // U of a Sum-normalized kernel
+    p.display[2] = {DisplayPalette::RedBlue, -1.0f, 1.0f};
+    p.graph = make_preset(GraphPreset::ShortLongRange);
+    return p;
+}
+
+Grid project_nutrient(const Project& p) { return seed_nutrient(p.nutrient, p.world_size, p.random_seed); }
 
 } // namespace lenia

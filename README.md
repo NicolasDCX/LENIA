@@ -12,7 +12,7 @@ workbench for editing kernels, rules and displays while the simulation runs.
 | `shaders/`        | GLSL compute and display shaders, compiled to SPIR-V at build time |
 | `apps/workbench/` | `lenia_workbench`, the Qt 6 Widgets + Vulkan workbench |
 | `apps/bench/`     | `lenia_bench`, a headless GPU benchmark |
-| `tests/`          | CTest suite: CPU tests, CPU/GPU parity and a workbench smoke test |
+| `tests/`          | CTest suite: CPU tests, CPU/GPU parity, workbench smoke and undo tests |
 | `patterns/`       | Bundled creature data (Orbium) and its license |
 | `docs/`           | Node graph, display graph, experiment and snapshot formats, benchmark |
 
@@ -51,8 +51,11 @@ is available.
 
 ## Documentation
 
-- [Node graph](docs/node_graph.md): per-cell rules, kernel and environment modulation
+- [Node graph](docs/node_graph.md): per-cell rules, kernel and environment modulation, and
+  reusable Kernel K / Convolve nodes for several neighborhoods on either field
 - [Display graph](docs/display_graph.md): how the viewport colors cells
+- [Two state fields](docs/state_fields.md): Density + Nutrient, and the nutrient trail demo
+- [Undo and redo](docs/undo.md): one history for graph, kernel and growth edits
 - [Experiment files](docs/projects.md) (`.leniaexp`) and [snapshots](docs/snapshots.md) (`.leniasnap`)
 - [GPU benchmark](docs/benchmark.md) and FFT convolution
 - [Pattern files](patterns/README.md)

@@ -28,6 +28,7 @@ struct KernelShape {
     int radius = 13;
     KernelCore core = KernelCore::ExponentialBump;
     std::vector<float> rings{1.0f};
+    bool operator==(const KernelShape&) const = default;
 };
 
 // K(r) for r = distance / radius. Throws std::invalid_argument if rings is empty.
@@ -62,6 +63,14 @@ float kernel_shell(const KernelShape& shape, const KernelWarp& warp, float r);
 
 // (2 * ceil(Re) + 1)^2 kernel of raw warped K values. Same preconditions as make_kernel.
 Grid make_kernel(const KernelShape& shape, const KernelWarp& warp);
+
+// Off-center kernel: the rings are centered on kernel cell (-shift_x, -shift_y) relative to the
+// middle, so the neighborhood convolve(grid, kernel) gathers the grid around
+// (x + shift_x, y + shift_y): a cell "looks" shift_x cells to the right (+x, columns) and shift_y
+// cells down (+y, rows). The grid is (2 * ceil(radius + max(|shift_x|, |shift_y|)) + 1)^2 raw K
+// values; zero shifts give make_kernel(shape) exactly. Same preconditions as make_kernel, and
+// throws std::invalid_argument for non-finite shifts.
+Grid make_kernel(const KernelShape& shape, float shift_x, float shift_y);
 
 struct KernelStats {
     double sum = 0.0;      // sum of all weights

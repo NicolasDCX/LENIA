@@ -16,6 +16,7 @@ struct GrowthParams {
     float sigma = 0.015f;
     float dt = 0.1f;
     GrowthFunction function = GrowthFunction::Gaussian;
+    bool operator==(const GrowthParams&) const = default;
 };
 
 // G(u) for the given function, mu and sigma.

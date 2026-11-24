@@ -16,6 +16,14 @@
 //
 // With u_ready != 0 the neighborhood buffer already holds U (written by fft_convolve.comp's
 // RowsInverse pass for this generation), which is used as is instead of summing the kernel.
+//
+// `src` and `dst` hold both state fields (lenia::WorldState): the density in the first
+// width * height floats, the nutrient in the next. A rule updates both from the current state;
+// the built-in update carries the nutrient over unchanged.
+//
+// `ker` holds the active kernel at 0 and the rule's Convolve kernels after it (at the offsets
+// lenia::pack_rule gave them). With a rule and preview != LENIA_NO_REGISTER the neighborhood
+// buffer receives that register (a Convolve node's U) instead of U, for the Neighborhood view.
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -43,6 +51,7 @@ layout(push_constant) uniform Params {
     float env_offset;
     uint rule;
     uint u_ready;
+    uint preview;
 } p;
 
 #include "lenia_math.glsl"
@@ -56,6 +65,7 @@ void main() {
     if (x >= p.width || y >= p.height) return;
 
     const uint i = y * p.width + x;
+    const uint plane = p.width * p.height; // the nutrient's offset
     float u;
     if (p.u_ready != 0u) {
         u = neighborhood[i];
@@ -65,9 +75,16 @@ void main() {
     }
     if (p.rule != 0u) {
         float g;
-        const float next = lenia_rule(x, y, p.width, p.height, src[i], u, g);
+        float next_n;
+        float shown;
+        const float next =
+            lenia_rule(x, y, p.width, p.height, 2u, src[i], src[plane + i], u, p.preview, g, next_n, shown);
         growth_field[i] = g;
-        if (p.advance != 0u) dst[i] = next;
+        if (p.preview != LENIA_NO_REGISTER) neighborhood[i] = shown;
+        if (p.advance != 0u) {
+            dst[i] = next;
+            dst[plane + i] = next_n;
+        }
         return;
     }
     float g = lenia_growth(u, p.mu, p.sigma, p.growth);
@@ -76,5 +93,8 @@ void main() {
                                                 p.env_sin, p.env_offset);
     }
     growth_field[i] = g;
-    if (p.advance != 0u) dst[i] = lenia_next(src[i], g, p.dt);
+    if (p.advance != 0u) {
+        dst[i] = lenia_next(src[i], g, p.dt);
+        dst[plane + i] = src[plane + i];
+    }
 }

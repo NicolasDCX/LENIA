@@ -7,6 +7,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace lenia {
@@ -112,29 +113,37 @@ std::uint64_t snapshot_checksum(std::string_view bytes) {
 }
 
 std::string write_snapshot(const Snapshot& s) {
-    const Grid& d = s.density;
     const auto side = static_cast<std::size_t>(s.project.world_size);
-    if (d.width != side || d.height != side || d.cells.size() != side * side) {
-        fail("the density is " + std::to_string(d.width) + " x " + std::to_string(d.height) +
-             " but the experiment's world is " + std::to_string(side) + " x " + std::to_string(side));
-    }
-    for (std::size_t i = 0; i < d.cells.size(); ++i) {
-        if (!std::isfinite(d.cells[i])) {
-            fail("cell (" + std::to_string(i % d.width) + ", " + std::to_string(i / d.width) + ") is not finite");
+    const auto check_field = [&](const Grid& g, const char* name) {
+        if (g.width != side || g.height != side || g.cells.size() != side * side) {
+            fail(std::string("the ") + name + " is " + std::to_string(g.width) + " x " + std::to_string(g.height) +
+                 " but the experiment's world is " + std::to_string(side) + " x " + std::to_string(side));
         }
-    }
+        for (std::size_t i = 0; i < g.cells.size(); ++i) {
+            if (!std::isfinite(g.cells[i])) {
+                fail(std::string(name) + " cell (" + std::to_string(i % g.width) + ", " +
+                     std::to_string(i / g.width) + ") is not finite");
+            }
+        }
+    };
+    const Grid& d = s.density;
+    check_field(d, "density");
+    const Grid n = s.nutrient.cells.empty() ? project_nutrient(s.project) : s.nutrient;
+    check_field(n, "nutrient");
     const std::string experiment = write_project(s.project);
 
     std::string out;
-    out.reserve(experiment.size() + d.cells.size() * 4 + 256);
+    out.reserve(experiment.size() + 2 * d.cells.size() * 4 + 256);
     out += "lenia-snapshot " + std::to_string(kSnapshotVersion) + "\n";
     out += "# Lenia workbench simulation snapshot (docs/snapshots.md); binary data follows, do not edit\n";
     out += "generation " + std::to_string(s.generation) + "\n";
     out += "experiment " + std::to_string(experiment.size()) + "\n";
     out += experiment;
-    out += "density " + std::to_string(d.width) + " " + std::to_string(d.height) + " f32le\n";
-    for (const float v : d.cells) append_f32le(out, v);
-    out += '\n';
+    for (const auto& [name, g] : {std::pair<const char*, const Grid*>{"density", &d}, {"nutrient", &n}}) {
+        out += std::string(name) + " " + std::to_string(g->width) + " " + std::to_string(g->height) + " f32le\n";
+        for (const float v : g->cells) append_f32le(out, v);
+        out += '\n';
+    }
     const auto checksum = snapshot_checksum(out);
     out += "checksum fnv1a64 " + hex64(checksum) + "\n";
     return out;
@@ -170,27 +179,35 @@ Snapshot parse_snapshot(std::string_view bytes) {
         }
     }
 
-    const std::vector<std::string> density = r.line("density");
-    expect_key(density, "density", 3);
-    const int w = parse_number<int>(density[1], "density width", 1, kMaxSide);
-    const int h = parse_number<int>(density[2], "density height", 1, kMaxSide);
-    if (density[3] != "f32le") fail("unknown density encoding '" + density[3] + "' (expected f32le)");
-    if (w != s.project.world_size || h != s.project.world_size) {
-        fail("the density is " + density[1] + " x " + density[2] + " but the experiment's world is " +
-             std::to_string(s.project.world_size) + " x " + std::to_string(s.project.world_size));
-    }
-    const std::size_t count = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
-    const std::string_view cells = r.take(count * 4, "the density");
-    s.density = Grid(static_cast<std::size_t>(w), static_cast<std::size_t>(h));
-    for (std::size_t i = 0; i < count; ++i) {
-        const float v = read_f32le(cells.data() + 4 * i);
-        if (!std::isfinite(v)) {
-            fail("density cell (" + std::to_string(i % s.density.width) + ", " + std::to_string(i / s.density.width) +
-                 ") is not finite");
+    // A field block: "<name> W H f32le", W x H floats, a newline.
+    const auto read_field = [&](const char* name) {
+        const std::string n(name);
+        const std::vector<std::string> head = r.line(name);
+        expect_key(head, name, 3);
+        const int w = parse_number<int>(head[1], (n + " width").c_str(), 1, kMaxSide);
+        const int h = parse_number<int>(head[2], (n + " height").c_str(), 1, kMaxSide);
+        if (head[3] != "f32le") fail("unknown " + n + " encoding '" + head[3] + "' (expected f32le)");
+        if (w != s.project.world_size || h != s.project.world_size) {
+            fail("the " + n + " is " + head[1] + " x " + head[2] + " but the experiment's world is " +
+                 std::to_string(s.project.world_size) + " x " + std::to_string(s.project.world_size));
         }
-        s.density.cells[i] = v;
-    }
-    if (r.take(1, "the line after the density") != "\n") fail("the density is longer than its size says");
+        const std::size_t count = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+        const std::string_view cells = r.take(count * 4, ("the " + n).c_str());
+        Grid g(static_cast<std::size_t>(w), static_cast<std::size_t>(h));
+        for (std::size_t i = 0; i < count; ++i) {
+            const float v = read_f32le(cells.data() + 4 * i);
+            if (!std::isfinite(v)) {
+                fail(n + " cell (" + std::to_string(i % g.width) + ", " + std::to_string(i / g.width) +
+                     ") is not finite");
+            }
+            g.cells[i] = v;
+        }
+        if (r.take(1, ("the line after the " + n).c_str()) != "\n") fail("the " + n + " is longer than its size says");
+        return g;
+    };
+    s.density = read_field("density");
+    // Version 1 has no nutrient: its experiment's start, which nothing in a version 1 graph reads.
+    s.nutrient = version >= 2 ? read_field("nutrient") : project_nutrient(s.project);
 
     // Everything up to here is covered by the checksum.
     const std::uint64_t expected = snapshot_checksum(bytes.substr(0, r.pos()));

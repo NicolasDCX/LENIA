@@ -63,6 +63,11 @@ public:
     // the CPU up to float rounding; rules made of exact operations (the Game of Life on the
     // Moore kernel) match exactly. Throws as step_lenia.
     Grid step_rule(const Grid& grid, const Grid& kernel, const RuleProgram& program, std::size_t generations = 1);
+    // The same for both state fields (lenia::step_rule on a WorldState): the density and the
+    // nutrient travel together in one buffer per generation and update simultaneously. Throws
+    // std::invalid_argument also if the fields differ in size.
+    WorldState step_rule(const WorldState& world, const Grid& kernel, const RuleProgram& program,
+                         std::size_t generations = 1);
 
     // How step_lenia computes the neighborhood; Direct (shaders/lenia_step.comp) by default.
     // With Fft, power-of-two grids the device supports (fft_supported) go through

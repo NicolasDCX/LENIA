@@ -6,6 +6,7 @@
 #include "lenia/node_graph.hpp"
 #include "lenia/pattern.hpp"
 #include "lenia/step.hpp"
+#include "lenia/world.hpp"
 
 #include <array>
 #include <istream>
@@ -23,7 +24,13 @@ namespace lenia {
 // Next state input; a version 1 file has none of them and runs the built-in Lenia update.
 // Version 3 adds the [display_graph] section; older files get a lone View node, so they show
 // the panel display ([display]) exactly as before.
-constexpr int kProjectVersion = 3;
+// Version 4 adds the second state field (world.hpp): the [nutrient] section, the Nutrient node,
+// the Simulation node's Next nutrient input, the Fields node's Nutrient output and the
+// [display] nutrient range. Older files start with a uniform nutrient of 1 that nothing reads.
+// Version 5 adds reusable kernels: the conv_kernel (Kernel K) and convolve (Convolve) node
+// kinds, and the Field outputs of Density A and Nutrient N that feed them. Older files have
+// none and run as before.
+constexpr int kProjectVersion = 5;
 
 // Workbench seed choices, in the order of its Seed menu.
 enum class SeedKind { Random, Pattern, Impulse, Empty };
@@ -45,6 +52,8 @@ struct Project {
     SeedKind seed = SeedKind::Pattern;
     int random_seed = 1;
     std::optional<Pattern> pattern;
+    // The nutrient field's start (seed_nutrient, with random_seed above).
+    NutrientSeed nutrient;
 
     // Display: the field shown and each field's palette and range.
     DisplayField field = DisplayField::Density;
@@ -71,5 +80,19 @@ Project parse_project(std::istream& in);
 // ring, normalization none), a glider seeded in the middle of a 128 x 128 world, a grayscale
 // display and the given Life graph preset (GameOfLife or GameOfLifeCompare).
 Project make_life_project(GraphPreset preset = GraphPreset::GameOfLife);
+
+// The Density + Nutrient demo: `creature` (the bundled Orbium) with its kernel and growth in a
+// 256 x 256 world full of nutrient (uniform 1), the NutrientTrail rule and the DensityNutrient
+// display. The creature consumes the nutrient as it glides and leaves a depleted trail that
+// slowly recovers.
+Project make_nutrient_trail_project(const Pattern& creature);
+
+// The two-kernel demo: the ShortLongRange rule (two Kernel K nodes, two Convolve nodes on the
+// density) on a 256 x 256 world of random noise, which settles into spots and labyrinths.
+Project make_short_long_project();
+
+// The world an experiment starts from: the density seed is the caller's (the workbench builds
+// it), the nutrient is seed_nutrient(p.nutrient, p.world_size, p.random_seed).
+Grid project_nutrient(const Project& p);
 
 } // namespace lenia

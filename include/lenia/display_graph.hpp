@@ -11,7 +11,7 @@
 namespace lenia {
 
 // Display graphs (docs/display_graph.md): a Graph in the Display domain colors the viewport.
-// Fields nodes read density, neighborhood and growth per cell, Color ramps map them to colors,
+// Fields nodes read density, neighborhood, growth and nutrient per cell, Color ramps map them to colors,
 // Color and Mix nodes combine colors, and the View node receives the result. compile_display
 // turns it into a straight-line program, the same for every cell, that the workbench's
 // fragment shader (shaders/workbench_view.frag) runs per pixel; run_display is the CPU
@@ -22,9 +22,9 @@ namespace lenia {
 // field through a palette), as before display graphs existed.
 
 // The panel display: field and palette choices, in the workbench's order.
-enum class DisplayField { Density, Neighborhood, Growth };
+enum class DisplayField { Density, Neighborhood, Growth, Nutrient };
 enum class DisplayPalette { Grayscale, Viridis, Inferno, RedBlue, IceFire };
-constexpr int kDisplayFieldCount = 3;
+constexpr int kDisplayFieldCount = 4;
 constexpr int kDisplayPaletteCount = 5;
 
 struct DisplayRange {
@@ -63,7 +63,7 @@ std::array<float, 3> sample_ramp(const std::vector<RampStop>& sorted, float t);
 
 enum class DisplayOpCode : std::uint32_t {
     Const = 0, // (k0, k1, k2, k3)
-    Field = 1, // field m0 (DisplayField) as (v, v, v, 1)
+    Field = 1, // field m0 (DisplayField, 3 = Nutrient) as (v, v, v, 1)
     Ramp = 2,  // ramp of r[a].x: t = clamp((v − k0) / (k1 − k0)), stops m0 .. m0 + m1 − 1
     Mix = 3,   // blend r[b] into r[a] by clamp(r[c].x, 0, 1), mode m0 (mix_node::ModeChoice)
 };
@@ -102,7 +102,8 @@ struct DisplayCompile {
 DisplayCompile compile_display(const Graph& graph, std::uint64_t generation);
 
 // sRGB color (RGBA, each in [0, 1]) of a cell with the given field values.
-std::array<float, 4> run_display(const DisplayProgram& program, float density, float neighborhood, float growth);
+std::array<float, 4> run_display(const DisplayProgram& program, float density, float neighborhood, float growth,
+                                 float nutrient = 0.0f);
 
 // The program as the GPU buffer holds it: count, output, stop count, 0, then kMaxDisplayOps
 // ops of 12 words (unused ones zero), then kMaxDisplayStops stops of 4 floats.
@@ -113,6 +114,10 @@ enum class DisplayPreset {
     Panel,         // a View node alone: the Simulation panel's display
     WiredPanel,    // the panel's field, palette and range as Fields -> Color ramp -> View
     GrowthOverlay, // example: density ramp, growth ramp screened over it, pulsing with time
+    // Density + Nutrient: the nutrient as soil (dark where depleted, green where full), the
+    // density's ramp mixed over it by the density itself, so creatures and their trails show
+    // together.
+    DensityNutrient,
 };
 // `field` and `range` are the panel display WiredPanel reproduces; the others ignore them.
 Graph make_display_preset(DisplayPreset preset, DisplayField field = DisplayField::Density,

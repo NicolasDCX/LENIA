@@ -5,9 +5,10 @@
 //
 // With program == 0 one field goes through a palette lookup table (the Simulation panel's
 // display). With program == 1 the display graph's program (lenia::pack_display) colors each
-// cell from its density, neighborhood and growth; display_color mirrors lenia::run_display
+// cell from its density, neighborhood, growth and nutrient; display_color mirrors lenia::run_display
 // (src/display_graph.cpp) op for op.
 
+// Both state fields: the density, then the nutrient at offset width * height.
 layout(std430, set = 0, binding = 0) readonly buffer Density { float density[]; };
 layout(std430, set = 0, binding = 1) readonly buffer Neighborhood { float neighborhood[]; };
 layout(std430, set = 0, binding = 2) readonly buffer Growth { float growth_field[]; };
@@ -45,7 +46,7 @@ layout(push_constant) uniform View {
     float cells_per_pixel;
     uint width;
     uint height;
-    uint field;           // 0 density, 1 neighborhood, 2 growth
+    uint field;           // 0 density, 1 neighborhood, 2 growth, 3 nutrient
     uint palette;         // index of the 256-entry table
     float lo;             // field value mapped to the first palette entry
     float hi;             // field value mapped to the last palette entry
@@ -54,6 +55,14 @@ layout(push_constant) uniform View {
 } v;
 
 layout(location = 0) out vec4 color;
+
+// lenia::DisplayField f of cell i.
+float field_value(uint i, uint f) {
+    if (f == 0u) return density[i];
+    if (f == 1u) return neighborhood[i];
+    if (f == 2u) return growth_field[i];
+    return density[v.width * v.height + i];
+}
 
 // Clamp to [0, 1] with NaN (and negatives) giving 0, as lenia's unit().
 float unit(float t) {
@@ -91,7 +100,7 @@ vec3 display_color(uint i) {
         switch (o.op) {
         case 0u: val = vec4(o.k0, o.k1, o.k2, o.k3); break; // Const
         case 1u: {                                           // Field
-            const float f = o.m0 == 0u ? density[i] : (o.m0 == 1u ? neighborhood[i] : growth_field[i]);
+            const float f = field_value(i, o.m0);
             val = vec4(f, f, f, 1.0);
             break;
         }
@@ -133,7 +142,7 @@ void main() {
     if (v.program != 0u) {
         color = vec4(display_color(i), 1.0);
     } else {
-        const float value = v.field == 0u ? density[i] : (v.field == 1u ? neighborhood[i] : growth_field[i]);
+        const float value = field_value(i, v.field);
         const float span = v.hi - v.lo;
         const float t = clamp(span != 0.0 ? (value - v.lo) / span : 0.0, 0.0, 1.0);
         color = palettes[v.palette * 256u + uint(t * 255.0 + 0.5)];

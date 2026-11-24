@@ -245,7 +245,8 @@ int main() {
             Graph g = make_display_preset(DisplayPreset::WiredPanel, static_cast<DisplayField>(field), range);
             const DisplayProgram p = compile(g);
             const auto at = [&](float v) {
-                return rgb(run_display(p, field == 0 ? v : 0.0f, field == 1 ? v : 0.0f, field == 2 ? v : 0.0f));
+                return rgb(run_display(p, field == 0 ? v : 0.0f, field == 1 ? v : 0.0f, field == 2 ? v : 0.0f,
+                                       field == 3 ? v : 0.0f));
             };
             bool exact = true, close = true;
             for (int i = 0; i < kPaletteTableSize; ++i) {
@@ -348,6 +349,10 @@ int main() {
         old.graph = make_preset(GraphPreset::Idle);
         std::string v2 = write_project(old);
         v2.replace(0, v2.find('\n'), "lenia-project 2");
+        const auto nutrient_section = v2.find("[nutrient]");
+        v2.erase(nutrient_section, v2.find("[display]", nutrient_section) - nutrient_section);
+        const auto nutrient_range = v2.find("\nnutrient ", v2.find("[display]"));
+        v2.erase(nutrient_range, v2.find('\n', nutrient_range + 1) - nutrient_range);
         const std::size_t start = v2.find("[display_graph]");
         const std::size_t end = v2.find("[graph]");
         v2.erase(start, end - start);
@@ -358,7 +363,8 @@ int main() {
                    "a version 2 file gets a lone View node");
             expect(!compile_display(q.display_graph, 0).linked, "so it shows the panel display, as when saved");
             expect(same(q.graph, old.graph), "its simulation graph reads as before");
-            expect(write_project(q).rfind("lenia-project 3\n", 0) == 0, "and saves as version 3");
+            expect(write_project(q).starts_with("lenia-project " + std::to_string(kProjectVersion) + "\n"),
+                   "and saves in the current format");
         } catch (const std::exception& e) {
             std::printf("FAILED: version 2 file: %s\n%s\n", e.what(), v2.c_str());
             ++failures;

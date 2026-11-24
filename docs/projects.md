@@ -12,6 +12,7 @@ replayed exactly. The format is implemented in `lenia::Project` (`include/lenia/
 | Kernel    | Radius, core, signed ring weights, normalization, and the painted layer cell by cell |
 | Growth    | Function (Gaussian / polynomial), μ, σ, dt |
 | World     | Size, seed choice (random square, loaded pattern, impulse, empty), random seed |
+| Nutrient  | How the second state field starts (uniform, random, gradient) and its level (`state_fields.md`) |
 | Pattern   | The loaded pattern's name, source, license and cells, if one is loaded (even when the seed is not "Loaded pattern", so switching to it later still works) |
 | Display   | The field shown, and each field's palette, low and high |
 | Graph     | Every node (id, kind, canvas position, all parameters) and every link, in order, cell rule nodes included. The environment is the Environment node's parameters and links; the update rule is whatever is linked into the Simulation node's Next state |
@@ -34,7 +35,9 @@ fails, a message explains which line and why, and the current experiment is unto
 
 - a missing or wrong `lenia-project <version>` header, or a version newer than the build reads;
 - in a version 1 file, rule node kinds, the Environment's Field output or the Simulation's
-  Next state input (none existed then); before version 3, a `[display_graph]` section;
+  Next state input (none existed then); before version 3, a `[display_graph]` section; before
+  version 4, a `[nutrient]` section, the `nutrient` node kind or display key, and links into the
+  Simulation's Next nutrient or out of Fields' Nutrient; from version 4, a missing `[nutrient]`;
 - node kinds in the wrong graph: display nodes in `[graph]`, simulation nodes (Kernel,
   Environment, Simulation, cell rule nodes) in `[display_graph]`; a display graph without
   exactly one View node;
@@ -59,16 +62,17 @@ renamed over it only once complete, so a failed save (disk full, permissions) le
 file intact. Before writing, the workbench parses its own output again and refuses to save
 anything it could not reopen.
 
-## Format, version 3
+## Format, version 5
 
 Plain UTF-8 text, one `key values` line each; blank lines and lines starting with `#` are
 ignored. There are no end-of-line comments: a `#` inside a line is data (a pattern source URL
 may contain one), so the parser rejects `mu 0.15 # note` as an extra value. Text values (pattern
 name, source, license) are the rest of the line, trimmed. Sections may come in any order;
-`[pattern]` is optional, the others are required (`[display_graph]` from version 3 on).
+`[pattern]` is optional, the others are required (`[display_graph]` from version 3 on,
+`[nutrient]` from version 4 on).
 
 ```
-lenia-project 3
+lenia-project 5
 
 [kernel]
 radius 13
@@ -94,6 +98,12 @@ size 256
 seed pattern
 random_seed 1
 
+[nutrient]
+# uniform | random | gradient
+start uniform
+# in [0, 1]
+level 1
+
 [pattern]
 name Orbium
 source ...
@@ -102,12 +112,13 @@ license ...
 cells 20 20
 
 [display]
-# density | neighborhood | growth
+# density | neighborhood | growth | nutrient
 field density
 # <field> <palette> <low> <high>; grayscale | viridis | inferno | redblue | icefire
 density viridis 0 1
 neighborhood inferno 0 0.3
 growth redblue -1 1
+nutrient inferno 0 1
 
 [display_graph]
 # same node / link lines as [graph]; a lone "node 1 view 560 40" shows the panel display
@@ -130,24 +141,31 @@ link 6 0 8 0
 
 Node kinds are `time`, `oscillator`, `constant`, `kernel`, `environment`, `output` (the
 Simulation node) and, since version 2, the cell rule nodes `density`, `neighborhood`, `growth`,
-`add`, `multiply`, `clamp`, `compare`, `select`, `life`. Parameters follow `node_spec()` in
+`add`, `multiply`, `clamp`, `compare`, `select`, `life`, since version 4 `nutrient` and, since
+version 5, the reusable kernels `conv_kernel` (Kernel K) and `convolve`.
+Parameters follow `node_spec()` in
 `src/node_graph.cpp`: Time `speed start`; Oscillator `wave period phase amplitude offset` (wave
 0–3 = sine, triangle, square, saw); Constant `value`; Kernel `radius_delta peak_shift sharpness`;
 Environment `pattern strength scale angle offset` (pattern 0–4 = uniform, spot, gradient,
 stripes, ripples; angle in degrees); Output none; Density and Neighborhood none; Growth `source
 function mu sigma dt` (source 0 = Simulation panel, 1 = this node; function 0 = gaussian,
-1 = polynomial); Add and Multiply `a b`; Clamp `x low high`; Compare `test a b` (test 0–5 =
+1 = polynomial); Nutrient none; Add and Multiply `a b`; Clamp `x low high`; Compare `test a b` (test 0–5 =
 `>`, `≥`, `<`, `≤`, `=`, `≠`); Select `condition if_true if_false`; Life `birth_mask
-survive_mask` (whole numbers 0–511). Ports are numbered from 0 in the order listed in
-`node_graph.md`: Environment outputs 0 Environment, 1 Field; Simulation inputs 0 Kernel,
-1 Environment, 2 Next state; Growth inputs 0 U, 1 μ, 2 σ and outputs 0 G, 1 dt.
+survive_mask` (whole numbers 0–511); Kernel K `radius core rings ring1 ring2 ring3 normalization
+shift_x shift_y` (radius 1–32; core 0–3 as in `[kernel]`; rings 1–3, the weights past it are
+stored but unused; normalization 0–3 = none, sum, positive, abs_sum; shifts in cells, −16 to 16,
+with radius + the larger shift at most 32); Convolve none. Ports are numbered from 0 in the
+order listed in `node_graph.md`: Environment outputs 0 Environment, 1 Field; Simulation inputs
+0 Kernel, 1 Environment, 2 Next state, 3 Next nutrient (version 4); Growth inputs 0 U, 1 μ, 2 σ
+and outputs 0 G, 1 dt; Density and Nutrient outputs 0 value, 1 Field (version 5); Kernel K
+output 0 K; Convolve inputs 0 Field, 1 Kernel and output 0 U.
 
 `[display_graph]` (version 3) has the same `node` and `link` lines with its own ids. Its kinds
 are `fields`, `ramp`, `color`, `mix`, `view` and the Value kinds `time`, `oscillator`,
 `constant`. Parameters: Fields none; Ramp `low high stops` then 10 stops of `position red green
 blue` (all 10 are written; only the first `stops`, 2–10, are used); Color `red green blue`; Mix
 `mode factor` (mode 0–3 = mix, add, multiply, screen); View none. Ports: Fields outputs
-0 Density, 1 Neighborhood, 2 Growth; Ramp input 0 Value; Mix inputs 0 A, 1 B, 2 Factor; View
+0 Density, 1 Neighborhood, 2 Growth, 3 Nutrient (version 4); Ramp input 0 Value; Mix inputs 0 A, 1 B, 2 Factor; View
 input 0 Color.
 
 ## Versioning
@@ -172,3 +190,15 @@ other section, key and node is as in version 2. A version 1 or 2 file has no dis
 opens with a lone View node, so the view shows its `[display]` settings exactly as when it was
 saved; saving it writes version 3 with that one-node display graph. `tests/test_display_graph.cpp`
 covers both directions; builds before version 3 reject version 3 files as newer.
+
+**Version 4** (two state fields, `state_fields.md`) added the required `[nutrient]` section, the
+`nutrient` node kind, the Simulation's Next nutrient input, Fields' Nutrient output and the
+`nutrient` display key. A version 1–3 file opens with a uniform nutrient of 1, which its graphs
+never read, and the default nutrient display range; it runs exactly as before. Saving it writes
+version 4. `tests/test_state_fields.cpp` covers the roundtrip and the version gates.
+
+**Version 5** (reusable kernels, `node_graph.md` *Several kernels*) added the `conv_kernel` and
+`convolve` node kinds and the Field outputs of Density A and Nutrient N that feed them; every
+section and key is as in version 4. A version 1–4 file has none of them and runs exactly as
+before; saving it writes version 5. An older file naming either kind is rejected with the
+version it needs. `tests/test_convolve_node.cpp` covers the roundtrip and the gate.

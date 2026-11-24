@@ -309,6 +309,33 @@ int main() {
         }
     }
 
+    // Equality, which the workbench's undo history uses to detect and restore edits: a copy is
+    // equal, and every kind of edit makes it unequal until restored from the copy.
+    {
+        const Graph original = make_preset(GraphPreset::BreathingKernel);
+        Graph g = original;
+        expect(g == original, "a copied graph compares equal");
+        const int id = g.nodes().front().id;
+        g.move_node(id, g.node(id)->x + 1.0f, g.node(id)->y);
+        expect(!(g == original), "a moved node makes it unequal");
+        g = original;
+        for (const Node& n : original.nodes()) {
+            if (n.kind != NodeKind::Oscillator) continue;
+            const float period = n.params[oscillator_node::Period];
+            g.set_param(n.id, oscillator_node::Period, period > 2.0f ? period - 1.0f : period + 1.0f);
+            break;
+        }
+        expect(!(g == original), "a changed parameter makes it unequal");
+        g = original;
+        g.disconnect(original.links().front().to_node, original.links().front().to_port);
+        expect(!(g == original), "a removed link makes it unequal");
+        g = original;
+        g.add_node(NodeKind::Constant);
+        expect(!(g == original), "an added node makes it unequal");
+        g = original;
+        expect(g == original && g.links() == original.links(), "assigning the copy back restores it exactly");
+    }
+
     std::printf(failures == 0 ? "PASS\n" : "FAIL\n");
     return failures == 0 ? 0 : 1;
 }

@@ -19,23 +19,27 @@ namespace lenia {
 // exactly the generations the original session would have computed next.
 
 // Format version written by write_snapshot; parse_snapshot reads versions 1..kSnapshotVersion.
-constexpr int kSnapshotVersion = 1;
+// Version 2 adds the nutrient field after the density; a version 1 snapshot gets its
+// experiment's starting nutrient (project_nutrient), which its graph cannot read anyway.
+constexpr int kSnapshotVersion = 2;
 
 struct Snapshot {
     Project project;              // the experiment, as an experiment file stores it
     std::uint64_t generation = 0; // generation `density` is at: the next step computes generation + 1
     Grid density;                 // project.world_size square, every cell finite
+    Grid nutrient;                // the same; empty when writing = project_nutrient(project)
 };
 
 // The snapshot as bytes: a text header, the experiment exactly as write_project writes it, the
-// density as raw little-endian IEEE 754 float32 (bit for bit) and a checksum. Throws
-// std::invalid_argument if the density is not project.world_size square or holds a non-finite
-// value, so nothing is written that parse_snapshot would reject.
+// density and the nutrient as raw little-endian IEEE 754 float32 (bit for bit) and a checksum.
+// Throws std::invalid_argument if a field is not project.world_size square or holds a
+// non-finite value, so nothing is written that parse_snapshot would reject.
 std::string write_snapshot(const Snapshot& snapshot);
 
 // Parses a snapshot. Strict, like parse_project: the "lenia-snapshot <version>" header, every
 // key in order, byte counts that match, a valid embedded experiment (parse_project), a density
-// of the experiment's world size with finite cells, a matching checksum and nothing after it.
+// (and, from version 2, a nutrient) of the experiment's world size with finite cells, a
+// matching checksum and nothing after it.
 // Throws std::invalid_argument saying what is wrong.
 Snapshot parse_snapshot(std::string_view bytes);
 

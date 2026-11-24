@@ -10,8 +10,9 @@ runs for every cell on the GPU.
 ## Nodes
 
 Port colors: orange **Value** (one number per generation), teal **Kernel**, green
-**Environment**, pink **Cell** (one number per cell). Links join equal types; a Value output
-may also feed a Cell input, which then gets the same value in every cell.
+**Environment**, pink **Cell** (one number per cell), indigo **Field** (a whole state field) and
+blue **Kernel K** (a reusable kernel). Links join equal types; a Value output may also feed a
+Cell input, which then gets the same value in every cell.
 
 | Node        | Inputs                          | Outputs            | What it does |
 |-------------|---------------------------------|--------------------|--------------|
@@ -20,8 +21,9 @@ may also feed a Cell input, which then gets the same value in every cell.
 | Constant    | –                               | Value              | A fixed value |
 | Kernel      | Radius Δ, Peak shift, Sharpness | Kernel             | Warps the Kernel panel's ring shape (below) |
 | Environment | Strength, Offset, Angle         | Environment, Field | Spatial growth field (below); Field = `Strength × E(x, y)` per cell |
-| Simulation  | Kernel, Environment, Next state | –                  | What the GPU uses (below) |
-| Density A, Neighborhood U, Growth, Add, Multiply, Clamp, Compare, Select, Life transition | | Cell | Cell rule nodes, see *Cell rules* |
+| Kernel K    | –                               | Kernel K           | A kernel of its own, for Convolve nodes (see *Several kernels*) |
+| Simulation  | Kernel, Environment, Next state, Next nutrient | – | What the GPU uses (below) |
+| Density A, Nutrient N, Neighborhood U, Convolve, Growth, Add, Multiply, Clamp, Compare, Select, Life transition | | Cell | Cell rule nodes, see *Cell rules*. Density A and Nutrient N also have a Field output |
 
 A linked **Value** input **adds** to the parameter of the same name (shown as "(+ link)" in the
 inspector), so the parameter is the base value and the link is the modulation. A linked
@@ -40,13 +42,53 @@ same programs op for op.
 | Node            | Inputs (unlinked default)                 | Output |
 |-----------------|-------------------------------------------|--------|
 | Density A       | –                                         | the cell's current state |
+| Nutrient N      | –                                         | the cell's current nutrient, the second state field (`state_fields.md`) |
 | Neighborhood U  | –                                         | `U = K ∗ A` with the **active kernel**: the one Simulation's Kernel input gives (warped by a Kernel node, or the Kernel panel's static kernel). With normalization *None* it is a raw weighted count |
+| Convolve        | Field (= Density), Kernel (required)      | `K ∗ field` with the linked Kernel K, per cell (see *Several kernels*) |
 | Growth G(U)     | U (= Neighborhood), μ, σ (parameters)     | G = Lenia growth of U (Gaussian `2·exp(−z²/2) − 1` or polynomial `2·max(0, 1 − z²/9)⁴ − 1`, `z = (U − μ)/σ`); dt (Value) = the step size. *Source = Simulation panel* follows the panel's function, μ, σ, dt (what Restore Orbium sets); *This node* uses the node's own |
 | Add, Multiply   | A, B                                      | `A + B`, `A × B` |
 | Clamp           | X, Low (0), High (1)                      | `min(max(X, Low), High)` |
 | Compare         | A, B; test `> ≥ < ≤ = ≠`                  | 1 where the test holds, else 0 (exact float comparison) |
 | Select          | Condition, If true (1), If false (0)      | If true where Condition ≥ 0.5, else If false |
 | Life transition | State (= Density), Neighbors (= Neighborhood); Birth mask, Survive mask | exact life-like rule: alive = State ≥ 0.5, `n = floor(Neighbors + 0.5)`; next = bit n of Survive (alive) or Birth (dead), 0 outside 0..8. A mask adds 2ⁿ per count n: Conway's B3/S23 is Birth 8, Survive 12; the node shows the rule name |
+
+The Simulation node's **Next nutrient** input is the next nutrient of each cell, compiled into
+the same program. Both inputs are computed from the current A, N and U, so they update
+simultaneously. Unlinked, the nutrient is kept as it is; linking it without Next state is an
+error. See `state_fields.md` and its *Density + Nutrient trail* example.
+
+### Several kernels
+
+Neighborhood U only knows the active kernel. For more, add **Kernel K** nodes and **Convolve**
+nodes:
+
+- **Kernel K** defines a kernel independent of the Kernel panel: Radius (1–32 cells), Core
+  (as the panel's), Rings (1–3) with a signed weight each, innermost first, and Normalization
+  (None, Sum = 1, Positive = 1, |Sum| = 1). **Shift X / Shift Y** (cells, +X right, +Y down)
+  move where a cell looks: with Shift X = 3 a cell gathers the field around the point 3 cells to
+  its right, so the kernel is no longer symmetric. The grid is `2·ceil(Radius + max(|Shift X|,
+  |Shift Y|)) + 1` cells square, at most 65 × 65 (`lenia::make_conv_kernel`). The node previews
+  the weights (red positive, blue negative) with their size, sum and how many Convolve nodes it
+  feeds. One Kernel K may feed any number of Convolve nodes.
+- **Convolve** computes `K ∗ field` per cell on the toroidal world, exactly as U is computed:
+  the field is the one linked into *Field* — a **Density A** or **Nutrient N** node's *Field*
+  output — or the density when unlinked; *Kernel* must be linked to a Kernel K (unlinked, the
+  rule does not compile and the world stops stepping, with the reason in the status bar).
+
+So the density and the nutrient can each be convolved with kernels of their own, and a rule can
+compare a short-range and a long-range neighborhood. Convolutions read the current state like
+everything else, so Next state and Next nutrient still update simultaneously.
+
+A rule may use at most **4 different convolutions** (`lenia::kMaxConvolutions`); Convolve nodes
+with the same field and equal kernels share one, whichever Kernel K nodes define them. The
+compiled program carries the normalized kernels (`RuleProgram::kernels`); the GPU stores them
+after the active kernel and each Convolve op sums its kernel per cell
+(`shaders/lenia_rule.glsl`), the CPU reference uses `lenia::convolve`. Results agree up to float
+rounding (`tests/test_vulkan_parity.cpp`).
+
+**Preview:** select a Convolve node the rule uses and the view's *Neighborhood* field (and the
+display graph's Fields → Neighborhood U) shows its U instead of the active kernel's, running or
+paused; deselect it to see U again. The node's preview line says whether the rule uses it.
 
 Any other Value node (Time, Oscillator, Constant, Growth's dt) linked into a cell input is a
 per-generation constant, so a rule can be modulated over time. Results that are not finite
@@ -81,11 +123,19 @@ Simulation moved to the rule's Field. The result is bit for bit the same on the 
   of a 128 × 128 world, grayscale density and a 0–8 neighborhood range. The glider moves one
   cell right and down every 4 generations. *Restore Orbium* returns to Lenia (Orbium, the
   default graph, a 256 world and the Lenia display ranges).
+- **Short / long range (two Kernel K nodes)** (also *Short / long range* in the Simulation
+  panel's Presets) loads `lenia::make_short_long_project`: two Gaussian-bell Kernel K nodes of
+  radius 4 and 12, each feeding a Convolve on the density, and
+  `next A = clamp(A + (S > w × L ? dt : −dt), 0, 1)` with S and L their outputs (w = 1,
+  dt = 0.25), on 256 × 256 random noise. Cells whose short-range average beats the long-range
+  one grow, the others fade: the noise settles into spots and labyrinths whose spacing follows
+  the long radius. Select either Convolve node to see S or L; edit a Kernel K's radius or shift
+  to change the pattern.
 
 ### Display
 
 How the fields are colored is the separate **display graph** (`display_graph.md`); with its
-View node unlinked (the default) the Simulation panel's *View* settings apply. The *Neighborhood* field shows U of the active kernel. The *Growth* field shows the rule's
+View node unlinked (the default) the Simulation panel's *View* settings apply. The *Neighborhood* field shows U of the active kernel, or the selected Convolve node's U (*Several kernels*). The *Growth* field shows the rule's
 first Growth node output (without the environment term), or `next − current` when the rule has
 no Growth node (the Game of Life: +1 births, −1 deaths); without a rule it is the built-in
 G(U) including the environment term, as before.

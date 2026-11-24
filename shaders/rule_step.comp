@@ -3,6 +3,11 @@
 
 // One generation of a node-graph cell rule per dispatch (lenia::VulkanStepper::step_rule):
 // the same interpreter as the workbench (lenia_rule.glsl), mirroring lenia::step_rule.
+//
+// With planes == 2 the buffers hold the density (width * height floats) followed by the
+// nutrient (as many again), and both are updated from the current state together; with
+// planes == 1 only the density, and the rule sees a nutrient of 0. `ker` holds the active kernel
+// followed by the rule's Convolve kernels (lenia::pack_rule_kernels).
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -15,6 +20,7 @@ layout(push_constant) uniform Params {
     uint height;
     uint kwidth;
     uint kheight;
+    uint planes;
 } p;
 
 #include "lenia_math.glsl"
@@ -28,7 +34,12 @@ void main() {
     if (x >= p.width || y >= p.height) return;
 
     const uint i = y * p.width + x;
+    const uint plane = p.width * p.height;
     const float u = lenia_neighborhood(x, y, p.width, p.height, p.kwidth, p.kheight);
+    const float n = p.planes > 1u ? src[plane + i] : 0.0;
     float g;
-    dst[i] = lenia_rule(x, y, p.width, p.height, src[i], u, g);
+    float next_n;
+    float unused;
+    dst[i] = lenia_rule(x, y, p.width, p.height, p.planes, src[i], n, u, LENIA_NO_REGISTER, g, next_n, unused);
+    if (p.planes > 1u) dst[plane + i] = next_n;
 }

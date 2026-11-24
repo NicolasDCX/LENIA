@@ -17,6 +17,7 @@ struct Grid {
 
     float& at(std::size_t x, std::size_t y) { return cells[y * width + x]; }
     float at(std::size_t x, std::size_t y) const { return cells[y * width + x]; }
+    bool operator==(const Grid&) const = default;
 };
 
 // Convolves `grid` with `kernel` using wraparound (toroidal) edges and raw weights.

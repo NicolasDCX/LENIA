@@ -278,10 +278,12 @@ void RingProfileWidget::edit(QPointF pos, Qt::MouseButtons buttons, Qt::Keyboard
     const int rings = static_cast<int>(model_->shape().rings.size());
     const int ring = std::clamp(static_cast<int>((pos.x() - pr.left()) / pr.width() * rings), 0, rings - 1);
     if (buttons & Qt::RightButton) {
+        editing_ = true;
         model_->set_ring(ring, 0.0f);
         return;
     }
     if (!(buttons & Qt::LeftButton)) return;
+    editing_ = true;
     float w = static_cast<float>(1.0 - 2.0 * (pos.y() - pr.top()) / pr.height());
     if (modifiers & Qt::ShiftModifier) w = std::round(w * 4.0f) / 4.0f;
     model_->set_ring(ring, w);
@@ -289,6 +291,13 @@ void RingProfileWidget::edit(QPointF pos, Qt::MouseButtons buttons, Qt::Keyboard
 
 void RingProfileWidget::mousePressEvent(QMouseEvent* e) { edit(e->position(), e->buttons(), e->modifiers()); }
 void RingProfileWidget::mouseMoveEvent(QMouseEvent* e) { edit(e->position(), e->buttons(), e->modifiers()); }
+
+void RingProfileWidget::mouseReleaseEvent(QMouseEvent* e) {
+    // Once every button is up: a drag that sweeps several rings is one step.
+    if (!editing_ || e->buttons() & (Qt::LeftButton | Qt::RightButton)) return;
+    editing_ = false;
+    emit edited(tr("Set ring weights"));
+}
 
 // ---------------------------------------------------------------------------------------------
 // KernelCanvas
@@ -367,10 +376,18 @@ void KernelCanvas::stroke(QPointF pos, Qt::MouseButtons buttons, Qt::KeyboardMod
     const QPointF c = (pos - gr.topLeft()) / cell;
     const bool erase = modifiers.testFlag(Qt::ControlModifier);
     const float amount = buttons.testFlag(Qt::LeftButton) ? strength_ : -strength_;
+    erasing_ = (stroking_ ? erasing_ : true) && erase;
+    stroking_ = true;
     model_->paint(c, brush_radius_, amount, erase ? KernelModel::Brush::Erase : KernelModel::Brush::Add, rings_);
 }
 
 void KernelCanvas::mousePressEvent(QMouseEvent* e) { stroke(e->position(), e->buttons(), e->modifiers()); }
+
+void KernelCanvas::mouseReleaseEvent(QMouseEvent* e) {
+    if (!stroking_ || e->buttons() & (Qt::LeftButton | Qt::RightButton)) return;
+    stroking_ = false;
+    emit edited(erasing_ ? tr("Erase kernel paint") : tr("Paint kernel"));
+}
 
 void KernelCanvas::mouseMoveEvent(QMouseEvent* e) {
     hover_ = e->position();

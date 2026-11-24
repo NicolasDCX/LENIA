@@ -8,17 +8,21 @@
 // - saves a snapshot, steps on, checks a damaged snapshot is refused without touching the world,
 //   opens the snapshot (paused at its generation even if running) and steps it again: the result
 //   equals the original continuation bit for bit, and differs if the generation is not restored;
-// - plays for a while: playback alone performs no GPU readbacks.
+// - plays for a while: playback alone performs no GPU readbacks;
+// - loads the Density + Nutrient trail demo: it runs, depletes the nutrient on the GPU, matches
+//   the CPU for a generation of both fields, and its snapshot reopens both fields bit for bit.
 //
 // Needs a desktop session and a Vulkan device; exits with 77 (skipped) without them.
 
 #include "main_window.hpp"
 
 #include "lenia/display_graph.hpp"
+#include "lenia/kernel_shape.hpp"
 #include "lenia/node_graph.hpp"
 #include "lenia/pattern.hpp"
 #include "lenia/project.hpp"
 #include "lenia/snapshot.hpp"
+#include "lenia/world.hpp"
 
 #include <QApplication>
 #include <QDir>
@@ -366,6 +370,68 @@ int main(int argc, char** argv) {
     // Saving the snapshot also requests one capture through the public window action.
     expect(view->readback_count() == static_cast<std::uint64_t>(captures) + 1,
            "one GPU readback per explicit capture and one for the snapshot save");
+
+    // --- Two state fields: the nutrient trail demo on the GPU. ----------------------------------
+    {
+        window.load_nutrient_trail();
+        expect(window.playing() && view->generation() < 5, "the nutrient trail demo loads and runs");
+        expect(lenia::evaluate(window.graph(), 0).nutrient_connected, "its graph writes the nutrient");
+        expect(lenia::compile_display(window.display_graph(), 0).linked, "its display graph shows both fields");
+        expect(wait_until([&] { return view->generation() >= 40; }), "the demo plays");
+        window.set_playing(false);
+        settle(100);
+        const std::optional<WorldCapture> c = capture(view, "nutrient trail");
+        if (c) {
+            const lenia::FieldStats n = lenia::field_stats(c->nutrient);
+            std::printf("nutrient trail at generation %llu: nutrient min %.3f, mean %.4f; density total %.1f\n",
+                        static_cast<unsigned long long>(c->generation), static_cast<double>(n.min), n.mean,
+                        lenia::field_stats(c->density).sum);
+            expect(c->nutrient.width == 256 && n.max <= 1.0f && n.min >= 0.0f, "the GPU nutrient is in [0, 1]");
+            expect(n.min < 0.95f, "the creature depletes the nutrient on the GPU");
+            expect(c->nutrient.at(0, 0) == 1.0f, "far from the creature the nutrient stays 1");
+
+            // One GPU generation from the captured state against the CPU reference.
+            const lenia::Grid kernel =
+                lenia::normalize_kernel(lenia::make_kernel(orbium.kernel), lenia::KernelNormalization::Sum);
+            const lenia::WorldState cpu = lenia::step_graph(lenia::WorldState{c->density, c->nutrient}, window.graph(),
+                                                            kernel, orbium.growth, c->generation);
+            view->upload_world(c->density, c->nutrient, c->generation);
+            view->step(1);
+            wait_generation(view, c->generation + 1);
+            if (const auto next = capture(view, "nutrient trail + 1")) {
+                float max_a = 0.0f, max_n = 0.0f;
+                for (std::size_t i = 0; i < cpu.density.cells.size(); ++i) {
+                    max_a = std::max(max_a, std::fabs(next->density.cells[i] - cpu.density.cells[i]));
+                    max_n = std::max(max_n, std::fabs(next->nutrient.cells[i] - cpu.nutrient.cells[i]));
+                }
+                std::printf("two fields, GPU vs CPU, one generation: max difference %.3g (A), %.3g (N)\n",
+                            static_cast<double>(max_a), static_cast<double>(max_n));
+                expect(max_a <= 1e-4f && max_n <= 1e-4f, "a GPU generation of both fields matches the CPU");
+            }
+
+            // A snapshot stores both fields and reopens them bit for bit.
+            const QString trail_path = dir.filePath(QStringLiteral("trail.leniasnap"));
+            const std::optional<WorldCapture> before = capture(view, "before the trail snapshot");
+            std::optional<QString> trail_saved;
+            window.save_snapshot_file(trail_path, [&](const QString& error) { trail_saved = error; });
+            expect(wait_until([&] { return trail_saved.has_value(); }) && trail_saved->isEmpty(),
+                   "two-field snapshot saved");
+            view->upload_world(lenia::Grid(256, 256, 0.0f), lenia::Grid(256, 256, 0.0f), 0);
+            expect(window.open_snapshot_file(trail_path).isEmpty(), "two-field snapshot opened");
+            settle(200);
+            if (const auto after = capture(view, "trail snapshot reopened"); after && before) {
+                expect(after->generation == before->generation && same(after->density, before->density) &&
+                           same(after->nutrient, before->nutrient),
+                       "the reopened snapshot holds both fields bit for bit");
+            }
+
+            // Inspection reads both fields back once and reports them.
+            window.inspect_fields(QPoint(0, 0));
+            expect(wait_until([&] { return window.inspection_text().contains(QStringLiteral("Nutrient N:")); }),
+                   "Inspect fields reports the nutrient");
+            std::printf("inspection: %s\n", qPrintable(window.inspection_text()));
+        }
+    }
 
     window.close();
     settle(100);

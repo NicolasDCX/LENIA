@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -58,6 +59,7 @@ struct RulePushConstants {
     std::uint32_t height;
     std::uint32_t kwidth;
     std::uint32_t kheight;
+    std::uint32_t planes; // 2: the nutrient follows the density
 };
 
 void check(VkResult result, const char* what) {
@@ -432,8 +434,12 @@ struct VulkanStepper::Impl {
     // pipeline passes its packed program (`words`, binding 3). With `fft_growth` (and `p` the
     // fft pipeline, `push` unused) each generation is fft_convolve.comp's RowsForward,
     // ConvolveColumns and fused RowsInverse, after the kernel transform if khat is stale.
+    // `grid` may stack `planes` fields of grid.height / planes rows each (the density, then
+    // the nutrient); the dispatches cover one field, the shader handles the rest. `kernel_tail`
+    // follows the kernel's weights in the kernel buffer (a rule's Convolve kernels).
     Grid run(Pipeline& p, const Grid& grid, const Grid& kernel, const void* push, std::uint32_t push_size,
-             std::size_t generations, const std::vector<std::uint32_t>* words, const GrowthParams* fft_growth) {
+             std::size_t generations, const std::vector<std::uint32_t>* words, const GrowthParams* fft_growth,
+             std::size_t planes = 1, const std::vector<float>* kernel_tail = nullptr) {
         last_gpu_ms.reset();
         last_transform_ms.reset();
         const bool use_fft = fft_growth != nullptr;
@@ -454,14 +460,16 @@ struct VulkanStepper::Impl {
             throw std::runtime_error("Vulkan: grid or kernel too large for 32-bit indexing");
         }
         const std::uint32_t groups_x = static_cast<std::uint32_t>((grid.width + kLocalSize - 1) / kLocalSize);
-        const std::uint32_t groups_y = static_cast<std::uint32_t>((grid.height + kLocalSize - 1) / kLocalSize);
+        const std::uint32_t groups_y = static_cast<std::uint32_t>((grid.height / planes + kLocalSize - 1) / kLocalSize);
         if (groups_x > properties.limits.maxComputeWorkGroupCount[0] ||
             groups_y > properties.limits.maxComputeWorkGroupCount[1]) {
             throw std::runtime_error("Vulkan: grid exceeds maxComputeWorkGroupCount");
         }
 
         const VkDeviceSize grid_bytes = grid.cells.size() * sizeof(float);
-        const VkDeviceSize kernel_bytes = kernel.cells.size() * sizeof(float);
+        const VkDeviceSize head_bytes = kernel.cells.size() * sizeof(float);
+        const VkDeviceSize tail_bytes = kernel_tail ? kernel_tail->size() * sizeof(float) : 0;
+        const VkDeviceSize kernel_bytes = head_bytes + tail_bytes;
         const VkDeviceSize program_bytes = words ? words->size() * sizeof(std::uint32_t) : 0;
         const VkDeviceSize kernel_offset = align_up(grid_bytes);
         const VkDeviceSize program_offset = kernel_offset + align_up(kernel_bytes);
@@ -485,7 +493,8 @@ struct VulkanStepper::Impl {
         // The only upload of the batch; later generations stay on the device.
         auto* staged = static_cast<unsigned char*>(staging.mapped);
         std::memcpy(staged, grid.cells.data(), grid_bytes);
-        std::memcpy(staged + kernel_offset, kernel.cells.data(), kernel_bytes);
+        std::memcpy(staged + kernel_offset, kernel.cells.data(), head_bytes);
+        if (tail_bytes > 0) std::memcpy(staged + kernel_offset + head_bytes, kernel_tail->data(), tail_bytes);
         if (words) std::memcpy(staged + program_offset, words->data(), program_bytes);
         if (upload_twiddles) {
             const std::vector<float> table = fft_twiddles(info.fft_max_size);
@@ -668,13 +677,58 @@ struct VulkanStepper::Impl {
         return run(lenia, grid, kernel, &pc, sizeof(pc), generations, nullptr, nullptr);
     }
 
+    // The program's Convolve kernels, checked, for the kernel buffer after the active kernel.
+    static std::vector<float> rule_kernels(const RuleProgram& rule_program) {
+        if (rule_program.ops.size() > kMaxRuleOps) throw std::invalid_argument("rule program has too many ops");
+        if (rule_program.kernels.size() > kMaxConvolutions) {
+            throw std::invalid_argument("rule program has too many convolutions");
+        }
+        for (const Grid& k : rule_program.kernels) {
+            if (k.width % 2 == 0 || k.height % 2 == 0) throw std::invalid_argument("kernel dimensions must be odd");
+            validate(k, "rule kernel");
+        }
+        std::vector<float> weights = pack_rule_kernels(rule_program);
+        if (weights.size() > kMaxConvolveWeights) throw std::invalid_argument("rule program's kernels are too large");
+        return weights;
+    }
+
     Grid step_rule(const Grid& grid, const Grid& kernel, const RuleProgram& rule_program, std::size_t generations) {
         last_gpu_ms.reset();
-        if (rule_program.ops.size() > kMaxRuleOps) throw std::invalid_argument("rule program has too many ops");
-        const std::vector<std::uint32_t> words = pack_rule(rule_program);
+        const std::vector<float> tail = rule_kernels(rule_program);
+        const std::vector<std::uint32_t> words =
+            pack_rule(rule_program, static_cast<std::uint32_t>(kernel.cells.size()));
         const RulePushConstants pc{static_cast<std::uint32_t>(grid.width), static_cast<std::uint32_t>(grid.height),
-                                   static_cast<std::uint32_t>(kernel.width), static_cast<std::uint32_t>(kernel.height)};
-        return run(rule, grid, kernel, &pc, sizeof(pc), generations, &words, nullptr);
+                                   static_cast<std::uint32_t>(kernel.width), static_cast<std::uint32_t>(kernel.height),
+                                   1u};
+        return run(rule, grid, kernel, &pc, sizeof(pc), generations, &words, nullptr, 1, &tail);
+    }
+
+    WorldState step_rule(const WorldState& world, const Grid& kernel, const RuleProgram& rule_program,
+                         std::size_t generations) {
+        last_gpu_ms.reset();
+        const std::vector<float> tail = rule_kernels(rule_program);
+        const Grid& a = world.density;
+        validate(a, "density");
+        validate(world.nutrient, "nutrient");
+        if (world.nutrient.width != a.width || world.nutrient.height != a.height) {
+            throw std::invalid_argument("the nutrient and density fields differ in size");
+        }
+        // One buffer per generation holds both fields: density rows, then nutrient rows.
+        Grid stacked(a.width, 2 * a.height);
+        std::copy(a.cells.begin(), a.cells.end(), stacked.cells.begin());
+        std::copy(world.nutrient.cells.begin(), world.nutrient.cells.end(),
+                  stacked.cells.begin() + static_cast<std::ptrdiff_t>(a.cells.size()));
+        const std::vector<std::uint32_t> words =
+            pack_rule(rule_program, static_cast<std::uint32_t>(kernel.cells.size()));
+        const RulePushConstants pc{static_cast<std::uint32_t>(a.width), static_cast<std::uint32_t>(a.height),
+                                   static_cast<std::uint32_t>(kernel.width), static_cast<std::uint32_t>(kernel.height),
+                                   2u};
+        const Grid out = run(rule, stacked, kernel, &pc, sizeof(pc), generations, &words, nullptr, 2, &tail);
+        WorldState next{Grid(a.width, a.height), Grid(a.width, a.height)};
+        const auto half = static_cast<std::ptrdiff_t>(a.cells.size());
+        std::copy(out.cells.begin(), out.cells.begin() + half, next.density.cells.begin());
+        std::copy(out.cells.begin() + half, out.cells.end(), next.nutrient.cells.begin());
+        return next;
     }
 };
 
@@ -695,6 +749,11 @@ Grid VulkanStepper::step_lenia(const Grid& grid, const Grid& kernel, const Growt
 Grid VulkanStepper::step_rule(const Grid& grid, const Grid& kernel, const RuleProgram& program,
                               std::size_t generations) {
     return impl_->step_rule(grid, kernel, program, generations);
+}
+
+WorldState VulkanStepper::step_rule(const WorldState& world, const Grid& kernel, const RuleProgram& program,
+                                    std::size_t generations) {
+    return impl_->step_rule(world, kernel, program, generations);
 }
 
 void VulkanStepper::set_convolution(ConvolutionMethod method) { impl_->method = method; }

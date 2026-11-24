@@ -20,7 +20,7 @@ value in every cell, fixed per generation.
 
 | Node       | Inputs (unlinked)                         | Outputs | What it does |
 |------------|-------------------------------------------|---------|--------------|
-| Fields     | –                                         | Density A, Neighborhood U, Growth | The cell's fields, exactly what the panel's *Field* choice shows (Growth: the rule's first Growth node, or next − current) |
+| Fields     | –                                         | Density A, Neighborhood U, Growth, Nutrient N | The cell's fields, exactly what the panel's *Field* choice shows (Growth: the rule's first Growth node, or next − current; Nutrient: the second state field, `state_fields.md`) |
 | Color ramp | Value (= density); Low, High; stops       | Color   | `t = clamp((Value − Low) / (High − Low), 0, 1)` (0 when High = Low), then the color at `t` between the stops, linear in sRGB |
 | Color      | –; Red, Green, Blue                       | Color   | A fixed sRGB color |
 | Mix        | A, B (black); Factor (parameter); Mode    | Color   | `f = clamp(Factor, 0, 1)`; **Mix** `A + (B − A)·f`, **Add** `A + B·f`, **Multiply** `A·(1 + (B − 1)·f)`, **Screen** `1 − (1 − A)(1 − B·f)`; each channel clamped to [0, 1] |
@@ -68,6 +68,9 @@ View node says *Too large*, and the status bar says why.
   blue–black–orange ramp over [−1, 1] (blue shrinking, black steady, orange growing), screened
   over it with a factor an Oscillator swings between 0.25 and 0.75 every 240 generations. Where
   growth is 0 the plain density ramp shows.
+- **Density over nutrient** (`DisplayPreset::DensityNutrient`, what the nutrient trail demo
+  uses) – the nutrient through a soil ramp (brown where eaten, green where full), with the
+  density through a black–blue–white ramp screened over it at factor 1.
 
 ## Determinism and saving
 

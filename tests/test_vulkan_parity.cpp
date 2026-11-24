@@ -5,6 +5,7 @@
 #include "lenia/rule.hpp"
 #include "lenia/step.hpp"
 #include "lenia/vulkan_step.hpp"
+#include "lenia/world.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -100,6 +101,44 @@ int compare_rule(const char* name, const lenia::Grid& grid, const lenia::Grid& k
 }
 
 lenia::RuleProgram compiled(const lenia::Graph& g, std::uint64_t generation, const lenia::GrowthParams& panel);
+
+// Both state fields (VulkanStepper::step_rule on a WorldState) against the CPU, each field
+// within its own tolerance (0: exact).
+int compare_world(const char* name, const lenia::WorldState& world, const lenia::Grid& kernel,
+                  const lenia::RuleProgram& program, lenia::VulkanStepper& gpu, std::size_t generations,
+                  float density_tol, float nutrient_tol) {
+    lenia::WorldState cpu_out = world;
+    for (std::size_t g = 0; g < generations; ++g) cpu_out = lenia::step_rule(cpu_out, kernel, program);
+    const lenia::WorldState gpu_out = gpu.step_rule(world, kernel, program, generations);
+    int failures = 0;
+    for (int f = 0; f < 2; ++f) {
+        const lenia::Grid& c = f == 0 ? cpu_out.density : cpu_out.nutrient;
+        const lenia::Grid& g = f == 0 ? gpu_out.density : gpu_out.nutrient;
+        const float tol = f == 0 ? density_tol : nutrient_tol;
+        if (g.width != c.width || g.height != c.height || g.cells.size() != c.cells.size()) {
+            std::printf("%s: SHAPE MISMATCH (%s)\n", name, f == 0 ? "density" : "nutrient");
+            return failures + 1;
+        }
+        float max_diff = 0.0f;
+        int bad = 0;
+        for (std::size_t i = 0; i < c.cells.size(); ++i) {
+            const float diff = std::fabs(g.cells[i] - c.cells[i]);
+            if (diff > max_diff) max_diff = diff;
+            if (!(diff <= tol)) {
+                if (bad < 10) {
+                    std::printf("%s: %s MISMATCH at %zu: gpu %.7f, cpu %.7f\n", name, f == 0 ? "density" : "nutrient",
+                                i, static_cast<double>(g.cells[i]), static_cast<double>(c.cells[i]));
+                }
+                ++bad;
+            }
+        }
+        std::printf("%s: %s, %zux%zu, %zu ops, %zu generation(s), max |gpu - cpu| = %.3g, %d mismatches\n", name,
+                    f == 0 ? "density" : "nutrient", c.width, c.height, program.ops.size(), generations,
+                    static_cast<double>(max_diff), bad);
+        failures += bad;
+    }
+    return failures;
+}
 
 // compare() through the FFT path (VulkanStepper::set_convolution), which must actually run
 // (`expect_fft`) or fall back to Direct for grids it does not support.
@@ -419,6 +458,110 @@ int main() {
         failures += compare_rule("rule_lenia_orbium_64x64", world, kernel, lenia_rule, gpu, 1, kTol);
     } catch (const std::exception& e) {
         std::printf("rules: FAILED: %s\n", e.what());
+        ++failures;
+    }
+
+    // Two state fields (lenia::WorldState): density and nutrient in one buffer, updated together.
+    try {
+        // Swap: next A = N, next N = A. Exact, and only right if both read the current state.
+        lenia::Graph swap;
+        const int a = swap.add_node(lenia::NodeKind::Density);
+        const int n = swap.add_node(lenia::NodeKind::Nutrient);
+        const int out = swap.add_node(lenia::NodeKind::Output);
+        swap.connect(n, 0, out, lenia::output_node::NextIn);
+        swap.connect(a, 0, out, lenia::output_node::NutrientIn);
+        const lenia::WorldState mixed{random_grid(37, 23, 31u), random_grid(37, 23, 32u)};
+        const lenia::RuleProgram swap_rule = compiled(swap, 0, {});
+        failures += compare_world("world_swap_37x23_gen1", mixed, ring, swap_rule, gpu, 1, 0.0f, 0.0f);
+        failures += compare_world("world_swap_37x23_gen5", mixed, ring, swap_rule, gpu, 5, 0.0f, 0.0f);
+        {
+            const lenia::WorldState swapped = gpu.step_rule(mixed, ring, swap_rule, 1);
+            const bool ok = same_bits(swapped.density, mixed.nutrient) && same_bits(swapped.nutrient, mixed.density);
+            std::printf("world_swap_gpu: %s\n", ok ? "fields exchanged exactly" : "MISMATCH");
+            failures += ok ? 0 : 1;
+        }
+
+        // A single-field rule through the two-field path leaves the nutrient bit for bit.
+        const lenia::RuleProgram rewired = compiled(rewired_rule(), 0, {});
+        const lenia::WorldState kept{random_grid(37, 23, 33u), random_grid(37, 23, 34u)};
+        failures += compare_world("world_rewired_keeps_nutrient", kept, ring, rewired, gpu, 3, kTol, 0.0f);
+        {
+            const lenia::WorldState out3 = gpu.step_rule(kept, ring, rewired, 3);
+            const bool ok = same_bits(out3.nutrient, kept.nutrient);
+            std::printf("world_rewired_gpu_nutrient: %s\n", ok ? "unchanged" : "MISMATCH");
+            failures += ok ? 0 : 1;
+        }
+
+        // The nutrient trail demo on a settled Orbium with a partly depleted nutrient field.
+        const lenia::Pattern orbium = lenia::load_pattern_file(std::string(LENIA_PATTERN_DIR) + "/orbium.lenia");
+        const lenia::Grid kernel =
+            lenia::normalize_kernel(lenia::make_kernel(orbium.kernel), lenia::KernelNormalization::Sum);
+        lenia::WorldState trail{lenia::Grid(64, 64, 0.0f), lenia::Grid(64, 64, 1.0f)};
+        lenia::stamp_pattern(trail.density, orbium.cells, 32, 32);
+        const lenia::Graph trail_graph = lenia::make_preset(lenia::GraphPreset::NutrientTrail);
+        const lenia::RuleProgram trail_rule = compiled(trail_graph, 0, orbium.growth);
+        for (int g = 0; g < 30; ++g) trail = lenia::step_rule(trail, kernel, trail_rule);
+        failures += compare_world("world_trail_orbium_64x64", trail, kernel, trail_rule, gpu, 1, kTol, kTol);
+    } catch (const std::exception& e) {
+        std::printf("two fields: FAILED: %s\n", e.what());
+        ++failures;
+    }
+
+    // Convolve(Field, Kernel) nodes: kernels of their own, after the active one in the kernel
+    // buffer, on either field.
+    try {
+        using namespace lenia;
+        const auto kernel_k = [](Graph& g, int radius, KernelCore core, std::vector<float> rings,
+                                 KernelNormalization norm, float sx, float sy) {
+            using namespace conv_kernel_node;
+            const int k = g.add_node(NodeKind::ConvKernel);
+            g.set_param(k, Radius, static_cast<float>(radius));
+            g.set_param(k, Core, static_cast<float>(core));
+            g.set_param(k, Rings, static_cast<float>(rings.size()));
+            for (std::size_t i = 0; i < rings.size(); ++i) g.set_param(k, Ring1 + static_cast<int>(i), rings[i]);
+            g.set_param(k, Normalization, static_cast<float>(norm));
+            g.set_param(k, ShiftX, sx);
+            g.set_param(k, ShiftY, sy);
+            return k;
+        };
+        const auto convolve_on = [](Graph& g, int field, int kernel) {
+            const int c = g.add_node(NodeKind::Convolve);
+            g.connect(field, field_node::FieldOut, c, convolve_node::FieldIn);
+            g.connect(kernel, 0, c, convolve_node::KernelIn);
+            return c;
+        };
+
+        // Independent kernels: next A = K1 ∗ A + U (the active kernel, too), next N = K2 ∗ N with
+        // a shifted, signed K2 (|weights| sum to 1, so N stays bounded) larger than the active kernel.
+        Graph g;
+        const int d = g.add_node(NodeKind::Density);
+        const int n = g.add_node(NodeKind::Nutrient);
+        const int u = g.add_node(NodeKind::Neighborhood);
+        const int k1 = kernel_k(g, 5, KernelCore::GaussianBell, {1.0f}, KernelNormalization::Sum, 0.0f, 0.0f);
+        const int k2 =
+            kernel_k(g, 9, KernelCore::Polynomial, {1.0f, -0.5f}, KernelNormalization::AbsoluteSum, 3.0f, -2.5f);
+        const int add = g.add_node(NodeKind::Add);
+        g.connect(convolve_on(g, d, k1), 0, add, add_node::A);
+        g.connect(u, 0, add, add_node::B);
+        const int out = g.add_node(NodeKind::Output);
+        g.connect(add, 0, out, output_node::NextIn);
+        g.connect(convolve_on(g, n, k2), 0, out, output_node::NutrientIn);
+        const RuleProgram two = compiled(g, 0, {});
+        std::printf("convolve: %zu kernels (%zux%zu, %zux%zu)\n", two.kernels.size(), two.kernels[0].width,
+                    two.kernels[0].height, two.kernels[1].width, two.kernels[1].height);
+        const WorldState mixed{random_grid(37, 23, 51u), random_grid(37, 23, 52u)};
+        failures += compare_world("convolve_density_nutrient_37x23", mixed, ring, two, gpu, 1, kTol, kTol);
+        failures += compare_world("convolve_density_nutrient_37x23_gen3", mixed, ring, two, gpu, 3, 1e-3f, 1e-3f);
+        // The single-field path: the nutrient Convolve reads 0 on both.
+        failures += compare_rule("convolve_single_field_37x23", mixed.density, ring, two, gpu, 1, kTol);
+
+        // The ShortLongRange demo, one generation from noise. Its S > L test flips by ±2 dt where
+        // S and L tie within float rounding; on noise that is rare, and the seed is fixed.
+        const RuleProgram short_long = compiled(make_preset(GraphPreset::ShortLongRange), 0, {});
+        const WorldState noise{random_grid(32, 32, 53u), Grid(32, 32, 1.0f)};
+        failures += compare_world("convolve_short_long_32x32", noise, ring, short_long, gpu, 1, kTol, 0.0f);
+    } catch (const std::exception& e) {
+        std::printf("convolve: FAILED: %s\n", e.what());
         ++failures;
     }
 

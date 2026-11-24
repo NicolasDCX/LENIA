@@ -2,7 +2,9 @@
 
 #include "palettes.hpp"
 
+#include <QAbstractSpinBox>
 #include <QAction>
+#include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDockWidget>
@@ -13,6 +15,7 @@
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QMenu>
 #include <QMenuBar>
@@ -87,7 +90,8 @@ QString write_file_atomically(const QString& path, const std::string& bytes) {
 
 // The project format names fields and palettes in the workbench's order.
 static_assert(PaletteCount == lenia::kDisplayPaletteCount);
-static_assert(static_cast<int>(Field::Growth) + 1 == lenia::kDisplayFieldCount);
+static_assert(static_cast<int>(Field::Nutrient) + 1 == lenia::kDisplayFieldCount);
+static_assert(static_cast<int>(Field::Nutrient) == static_cast<int>(lenia::DisplayField::Nutrient));
 
 QDoubleSpinBox* make_double(double lo, double hi, double step, int decimals, double value) {
     auto* s = new QDoubleSpinBox;
@@ -113,8 +117,18 @@ ViewSettings default_view(Field field) {
     case Field::Density: return {Field::Density, Viridis, 0.0f, 1.0f};
     case Field::Neighborhood: return {Field::Neighborhood, Inferno, 0.0f, 0.3f};
     case Field::Growth: return {Field::Growth, RedBlue, -1.0f, 1.0f};
+    case Field::Nutrient: return {Field::Nutrient, Inferno, 0.0f, 1.0f};
     }
     return {};
+}
+
+QString describe(const char* name, const lenia::FieldStats& s) {
+    return QObject::tr("%1 min %2, mean %3, max %4, total %5")
+        .arg(QLatin1String(name))
+        .arg(static_cast<double>(s.min), 0, 'f', 4)
+        .arg(s.mean, 0, 'f', 4)
+        .arg(static_cast<double>(s.max), 0, 'f', 4)
+        .arg(s.sum, 0, 'f', 1);
 }
 
 QWidget* scrollable(QWidget* content) {
@@ -183,6 +197,22 @@ MainWindow::MainWindow(QVulkanInstance* instance) {
     statusBar()->addWidget(generation_);
     statusBar()->addPermanentWidget(device_);
 
+    // One history for both graphs, the kernel and the growth (docs/undo.md). Reset below, once
+    // the bundled Orbium is loaded.
+    history_ = new EditHistory([this] { return capture_setup(); }, [this](const SetupParts& p) { apply_setup(p); },
+                               this);
+    connect(history_, &EditHistory::applied, this, [this](const QString& text, bool undo) {
+        statusBar()->showMessage((undo ? tr("Undo: %1") : tr("Redo: %1")).arg(text), 5000);
+        report_rule(); // after: a rule that does not compile is the more important note
+    });
+    connect(node_editor_, &NodeEditor::edited, this, [this](const QString& text, const QString& key) {
+        history_->commit(tr("%1 (node graph)").arg(text), key.isEmpty() ? key : QStringLiteral("graph ") + key);
+    });
+    connect(display_editor_, &NodeEditor::edited, this, [this](const QString& text, const QString& key) {
+        history_->commit(tr("%1 (display graph)").arg(text), key.isEmpty() ? key : QStringLiteral("display ") + key);
+    });
+    qApp->installEventFilter(this);
+
     build_actions();
     build_menus();
 
@@ -196,6 +226,20 @@ MainWindow::MainWindow(QVulkanInstance* instance) {
     });
     connect(node_editor_, &NodeEditor::graph_changed, view_, &LeniaView::inputs_changed);
     connect(node_editor_, &NodeEditor::graph_changed, this, &MainWindow::report_rule);
+    // Selecting a Convolve node previews its U in the Neighborhood field (inputs_at); the
+    // re-analysis shows it at once, also while paused.
+    connect(node_editor_->canvas(), &NodeCanvas::selection_changed, this, [this](int id) {
+        const lenia::Node* n = graph_.node(id);
+        const bool was = previewing_;
+        previewing_ = n && n->kind == lenia::NodeKind::Convolve;
+        if (!previewing_ && !was) return;
+        view_->inputs_changed();
+        if (previewing_) {
+            statusBar()->showMessage(tr("The Neighborhood field shows Convolve node %1's U while it is selected")
+                                         .arg(id),
+                                     6000);
+        }
+    });
     connect(node_editor_, &NodeEditor::preset_requested, this, &MainWindow::load_graph_preset);
     connect(node_editor_, &NodeEditor::message, this, [this](const QString& m) { statusBar()->showMessage(m, 6000); });
     connect(display_editor_, &NodeEditor::graph_changed, this, &MainWindow::display_graph_changed);
@@ -227,7 +271,75 @@ MainWindow::MainWindow(QVulkanInstance* instance) {
     push_growth();
     reset_world(); // random square, replaced below unless the bundled Orbium fails to load
     restore_orbium();
+    reset_history();
     resize(1600, 1000);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Undo history
+
+SetupState MainWindow::capture_setup() const {
+    SetupState s;
+    s.graph = graph_;
+    s.display_graph = display_graph_;
+    s.kernel = {kernel_->shape(), kernel_->normalization(), kernel_->paint_layer()};
+    s.growth = growth_;
+    return s;
+}
+
+void MainWindow::apply_setup(const SetupParts& parts) {
+    // Like an edit made by hand: inputs_changed / display_changed re-analyze and redraw, the
+    // world, its generation and play / pause stay as they are.
+    if (parts.kernel) {
+        kernel_->restore(parts.kernel->shape, parts.kernel->normalization, parts.kernel->paint);
+        sync_kernel_controls();
+    }
+    if (parts.growth) {
+        const lenia::GrowthParams& g = *parts.growth;
+        {
+            const QSignalBlocker b1(mu_), b2(sigma_), b3(dt_), b4(growth_function_);
+            growth_function_->setCurrentIndex(static_cast<int>(g.function));
+            mu_->setValue(g.mu);
+            sigma_->setValue(g.sigma);
+            dt_->setValue(g.dt);
+        }
+        // Exactly as recorded, not as read back from the spin boxes.
+        growth_ = g;
+        node_editor_->canvas()->set_panel_growth(growth_);
+        view_->inputs_changed();
+    }
+    if (parts.graph) {
+        graph_ = *parts.graph;
+        node_editor_->canvas()->graph_restored();
+        view_->inputs_changed();
+    }
+    if (parts.display_graph) {
+        display_graph_ = *parts.display_graph;
+        display_editor_->canvas()->graph_restored();
+        display_graph_changed();
+    }
+}
+
+void MainWindow::reset_history() {
+    if (history_) history_->reset();
+}
+
+void MainWindow::commit_panel_edit(const QString& text, const QString& merge_key) {
+    if (!history_) return;
+    history_->commit(text, merge_key.isEmpty() ? merge_key
+                                               : QStringLiteral("panel %1 %2").arg(merge_key).arg(panel_session_));
+}
+
+bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
+    if (event->type() == QEvent::ShortcutOverride && undo_action_ &&
+        (qobject_cast<QAbstractSpinBox*>(watched) || qobject_cast<QAbstractSpinBox*>(watched->parent()))) {
+        const QKeySequence keys(static_cast<QKeyEvent*>(event)->keyCombination());
+        if (undo_action_->shortcuts().contains(keys) || redo_action_->shortcuts().contains(keys)) {
+            event->ignore(); // not overridden: the Edit menu's shortcut runs
+            return true;
+        }
+    }
+    return QMainWindow::eventFilter(watched, event);
 }
 
 GenerationInputs MainWindow::inputs_at(std::uint64_t generation) {
@@ -247,7 +359,7 @@ GenerationInputs MainWindow::inputs_at(std::uint64_t generation) {
         in.kernel = warped_kernel_;
     }
     if (f.environment_connected) in.environment = f.environment;
-    if (f.rule_connected) {
+    if (f.rule_connected || f.nutrient_connected) { // Next nutrient alone: compile_rule's error
         lenia::RuleCompile rule = lenia::compile_rule(graph_, generation, growth_);
         if (!rule.error.empty()) {
             in.kernel.reset(); // LeniaView does not step; report_rule tells the user why
@@ -258,6 +370,11 @@ GenerationInputs MainWindow::inputs_at(std::uint64_t generation) {
             rule_ = std::make_shared<const lenia::RuleProgram>(std::move(rule.program));
         }
         in.rule = rule_;
+        // A selected Convolve node the rule uses: its U replaces U in the Neighborhood field.
+        const int selected = node_editor_->canvas()->selected_node();
+        for (const auto& [node, reg] : rule.convolve_registers) {
+            if (node == selected) in.preview = reg;
+        }
     }
     return in;
 }
@@ -274,9 +391,36 @@ void MainWindow::load_graph_preset(lenia::GraphPreset preset) {
         load_life(preset);
         return;
     }
-    // A Lenia rule on the Moore kernel and a glider does nothing useful: bring Orbium back.
-    if (life_loaded_) restore_orbium();
+    if (preset == lenia::GraphPreset::NutrientTrail) {
+        load_nutrient_trail();
+        return;
+    }
+    if (preset == lenia::GraphPreset::ShortLongRange) {
+        load_short_long();
+        return;
+    }
+    // A Lenia rule on the Moore kernel and a glider (or on the two-kernel demo's noise) does
+    // nothing useful: bring Orbium back.
+    if (life_loaded_ || short_long_loaded_) restore_orbium();
     node_editor_->load_preset(preset);
+}
+
+void MainWindow::load_short_long() {
+    lenia::Project p = lenia::make_short_long_project();
+    const QString error = check_project(p);
+    if (!error.isEmpty()) { // cannot happen with the workbench's limits; guards future edits
+        QMessageBox::warning(this, tr("Short / long range"), error);
+        return;
+    }
+    apply_project(std::move(p));
+    short_long_loaded_ = true;
+    run_->setChecked(true);
+    statusBar()->showMessage(tr("Two kernels on one field: a cell grows where its short-range average (Kernel K, "
+                                "radius %1) beats its long-range one (radius %2). Select a Convolve node to see its "
+                                "U in the Neighborhood view; edit a Kernel K to change the spacing.")
+                                 .arg(lenia::kShortRadius)
+                                 .arg(lenia::kLongRadius),
+                             15000);
 }
 
 void MainWindow::load_life(lenia::GraphPreset preset) {
@@ -293,6 +437,66 @@ void MainWindow::load_life(lenia::GraphPreset preset) {
                                 "seed. R restarts it; the glider moves one cell diagonally every 4 generations."),
                              12000);
 }
+
+void MainWindow::load_nutrient_trail() {
+    lenia::Pattern orbium;
+    try {
+        QFile file(QString::fromLatin1(kOrbiumResource));
+        if (!file.open(QIODevice::ReadOnly)) throw std::runtime_error("cannot open the bundled Orbium resource");
+        std::istringstream in(file.readAll().toStdString());
+        orbium = lenia::parse_pattern(in);
+    } catch (const std::exception& e) {
+        QMessageBox::warning(this, tr("Nutrient trail"), QString::fromUtf8(e.what()));
+        return;
+    }
+    lenia::Project p = lenia::make_nutrient_trail_project(orbium);
+    const QString error = check_project(p);
+    if (!error.isEmpty()) { // cannot happen with the workbench's limits; guards future edits
+        QMessageBox::warning(this, tr("Nutrient trail"), error);
+        return;
+    }
+    apply_project(std::move(p));
+    trail_loaded_ = true;
+    run_->setChecked(true);
+    statusBar()->showMessage(tr("Density + Nutrient: Orbium eats the nutrient (green) as it glides and leaves a "
+                                "dark, slowly recovering trail; growth slows where the nutrient is depleted. View → "
+                                "Field shows either field; alt + click a cell to inspect both."),
+                             15000);
+}
+
+void MainWindow::inspect_fields(std::optional<QPoint> cell) {
+    if (view_->capture_pending()) {
+        statusBar()->showMessage(tr("An inspection or snapshot is already reading the world"), 5000);
+        return;
+    }
+    // Deferred out of the frame that read the world back (capture_world's rule).
+    view_->capture_world([this, cell](const WorldCapture& c) {
+        QTimer::singleShot(0, this, [this, cell, c] {
+            if (!c.error.isEmpty()) {
+                statusBar()->showMessage(tr("Inspection failed: %1").arg(c.error), 8000);
+                return;
+            }
+            QString text = tr("Generation %1\n%2\n%3")
+                               .arg(c.generation)
+                               .arg(describe("Density A:", lenia::field_stats(c.density)),
+                                    describe("Nutrient N:", lenia::field_stats(c.nutrient)));
+            if (cell && cell->x() >= 0 && cell->y() >= 0 && static_cast<std::size_t>(cell->x()) < c.density.width &&
+                static_cast<std::size_t>(cell->y()) < c.density.height) {
+                const auto x = static_cast<std::size_t>(cell->x()), y = static_cast<std::size_t>(cell->y());
+                const QString at = tr("Cell (%1, %2): A = %3, N = %4")
+                                       .arg(cell->x())
+                                       .arg(cell->y())
+                                       .arg(static_cast<double>(c.density.at(x, y)), 0, 'f', 4)
+                                       .arg(static_cast<double>(c.nutrient.at(x, y)), 0, 'f', 4);
+                text += QStringLiteral("\n") + at;
+                statusBar()->showMessage(tr("%1 at generation %2").arg(at).arg(c.generation), 10000);
+            }
+            inspection_->setText(text);
+        });
+    });
+}
+
+QString MainWindow::inspection_text() const { return inspection_->text(); }
 
 std::shared_ptr<const lenia::DisplayProgram> MainWindow::display_at(std::uint64_t generation) {
     lenia::DisplayCompile c = lenia::compile_display(display_graph_, generation);
@@ -314,6 +518,7 @@ void MainWindow::load_display_preset(lenia::DisplayPreset preset) {
                                                 panel_range());
     display_editor_->canvas()->graph_replaced();
     display_graph_changed();
+    history_->commit(tr("Load example (display graph)"));
     statusBar()->showMessage(preset == lenia::DisplayPreset::Panel
                                  ? tr("Display graph reset: the view shows the Simulation panel's field and palette")
                                  : tr("Loaded a display graph example; it colors the view, running or paused"),
@@ -328,6 +533,7 @@ void MainWindow::wire_panel_display() {
     }
     display_editor_->canvas()->graph_replaced();
     display_graph_changed();
+    history_->commit(tr("Wire the panel display (display graph)"));
     statusBar()->showMessage(tr("Wired the panel display as nodes: same picture, now editable"), 8000);
 }
 
@@ -368,12 +574,27 @@ void MainWindow::build_menus() {
     save_snap->setShortcut(QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_S));
     save_snap->setStatusTip(tr("Save the running world as it is now (density and generation) with the experiment, "
                                "to continue exactly from here later"));
-    file_actions_ = {open, save, save_as, open_snap, save_snap};
+    // One history for the node graph, the display graph, the kernel and the growth
+    // (docs/undo.md). Application-wide shortcuts, so they also work in floating panels.
+    QMenu* edit = menuBar()->addMenu(tr("&Edit"));
+    undo_action_ = history_->create_undo_action(this);
+    undo_action_->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Z));
+    undo_action_->setStatusTip(tr("Undo the last edit of a graph, the kernel or the growth; the world keeps its "
+                                  "generation, density and play / pause"));
+    redo_action_ = history_->create_redo_action(this);
+    redo_action_->setShortcuts({QKeySequence(Qt::CTRL | Qt::Key_Y), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Z)});
+    redo_action_->setStatusTip(tr("Redo the last undone edit"));
+    for (QAction* a : {undo_action_, redo_action_}) {
+        a->setShortcutContext(Qt::ApplicationShortcut);
+        edit->addAction(a);
+    }
+
+    shortcut_actions_ = {open, save, save_as, open_snap, save_snap, undo_action_, redo_action_};
     // The Vulkan view is a separate QWindow: forward its Ctrl shortcuts to these actions.
     connect(view_, &LeniaView::shortcut_pressed, this, [this](const QKeySequence& keys) {
-        for (QAction* a : file_actions_) {
-            if (a->shortcut() == keys) {
-                a->trigger();
+        for (QAction* a : shortcut_actions_) {
+            if (a->shortcuts().contains(keys)) {
+                a->trigger(); // nothing if disabled
                 return;
             }
         }
@@ -405,6 +626,12 @@ void MainWindow::build_menus() {
                "<p>The default graph wires Lenia: clamp(A + dt × (G(U) + field), 0, 1), with Growth "
                "following the Simulation panel. <i>Example → Game of Life</i> (or the Game of Life preset "
                "button) loads Conway's rule with the raw Moore kernel and a glider.</p>"
+               "<p><b>Two state fields.</b> Besides the density A every cell has a nutrient N: the "
+               "<b>Nutrient N</b> node reads it, the Simulation node's <i>Next nutrient</i> writes it. Each "
+               "generation computes next A and next N from the same current state, so the order of the rows "
+               "does not matter. Unlinked, the nutrient stays as it is. <i>Example → Density + Nutrient "
+               "trail</i> (or Presets → Nutrient trail) shows uptake and recovery that depend on both "
+               "fields.</p>"
                "<p>Drag from an output port to an input port to link; drag a linked input away to unlink; "
                "right-click for add / delete; Del removes the selection. Select a node to edit it on the "
                "right. A linked Value input adds to the parameter of the same name; a linked cell input "
@@ -417,7 +644,7 @@ void MainWindow::build_menus() {
             this, tr("Display graph"),
             tr("<p>The <b>Display graph</b> panel (tabbed with the node graph) decides how the viewport colors "
                "each cell. The GPU runs it per pixel every frame, running or paused.</p>"
-               "<ul><li><b>Fields</b> outputs the cell's density A, neighborhood U and growth.</li>"
+               "<ul><li><b>Fields</b> outputs the cell's density A, neighborhood U, growth and nutrient N.</li>"
                "<li><b>Color ramp</b> maps a value between Low and High onto its color stops. Select it to "
                "edit the stops: drag to move, double-click a stop to recolor it, double-click the bar to add "
                "one, right-click to remove; or set them from a palette.</li>"
@@ -426,16 +653,20 @@ void MainWindow::build_menus() {
                "<li><b>View</b> shows what is linked into it. Unlinked, the Simulation panel's field and "
                "palette are shown, as before; <i>Wire the panel display as nodes</i> turns them into an "
                "editable ramp.</li></ul>"
-               "<p>Try <i>Example → Density + pulsing growth overlay → Load</i>. The display graph is saved "
+               "<p>Try <i>Example → Density + pulsing growth overlay → Load</i>, or <i>Density over "
+               "nutrient</i> for the two state fields together. The display graph is saved "
                "with the experiment and never changes the simulation.</p>"));
     });
     help->addAction(tr("Keyboard shortcuts"), this, [this] {
         QMessageBox::information(this, tr("Keyboard shortcuts"),
                                  tr("Space  run / pause\nN  pause and step (Step ×N count)\nR  reset to the seed "
-                                    "(generation 0)\nI  impulse seed\nO  restore Orbium\nF  fit the world view\n\n"
+                                    "(generation 0)\nI  impulse seed\nO  restore Orbium\nF  fit the world view\n"
+                                    "Alt + click  inspect a cell's density and nutrient\n\n"
                                     "Ctrl+O  open experiment\nCtrl+S  save experiment\n"
                                     "Ctrl+Shift+S  save experiment as\n"
                                     "Ctrl+Alt+O  open snapshot\nCtrl+Alt+S  save snapshot\n\n"
+                                    "Ctrl+Z  undo a graph, kernel or growth edit\n"
+                                    "Ctrl+Y / Ctrl+Shift+Z  redo\n\n"
                                     "Node canvas: Del / Backspace delete selection, Home frame all"));
     });
 }
@@ -460,7 +691,8 @@ QWidget* MainWindow::build_kernel_panel() {
 
     auto* profile_box = new QGroupBox(tr("Radial profile (drag to set signed ring weights)"));
     auto* profile_layout = new QVBoxLayout(profile_box);
-    profile_layout->addWidget(new RingProfileWidget(kernel_));
+    auto* profile = new RingProfileWidget(kernel_);
+    profile_layout->addWidget(profile);
     layout->addWidget(profile_box);
 
     auto* paint_box = new QGroupBox(tr("Paint (left +, right −, ctrl erases)"));
@@ -485,12 +717,29 @@ QWidget* MainWindow::build_kernel_panel() {
     layout->addWidget(kernel_summary_);
     layout->addStretch();
 
-    connect(radius_, &QSpinBox::valueChanged, this, [this](int r) { kernel_->set_radius(r); });
-    connect(core_, &QComboBox::currentIndexChanged, this,
-            [this](int i) { kernel_->set_core(static_cast<lenia::KernelCore>(i)); });
-    connect(ring_count_, &QSpinBox::valueChanged, this, [this](int n) { kernel_->set_ring_count(n); });
-    connect(normalization_, &QComboBox::currentIndexChanged, this,
-            [this](int i) { kernel_->set_normalization(static_cast<lenia::KernelNormalization>(i)); });
+    // Each edit is an undo step; a spin box's steps are one until it loses focus.
+    connect(radius_, &QSpinBox::valueChanged, this, [this](int r) {
+        kernel_->set_radius(r);
+        commit_panel_edit(tr("Kernel radius"), QStringLiteral("radius"));
+    });
+    connect(core_, &QComboBox::currentIndexChanged, this, [this](int i) {
+        kernel_->set_core(static_cast<lenia::KernelCore>(i));
+        commit_panel_edit(tr("Kernel core"));
+    });
+    connect(ring_count_, &QSpinBox::valueChanged, this, [this](int n) {
+        kernel_->set_ring_count(n);
+        commit_panel_edit(tr("Kernel rings"), QStringLiteral("rings"));
+    });
+    connect(normalization_, &QComboBox::currentIndexChanged, this, [this](int i) {
+        kernel_->set_normalization(static_cast<lenia::KernelNormalization>(i));
+        commit_panel_edit(tr("Kernel normalization"));
+    });
+    for (QAbstractSpinBox* s : std::initializer_list<QAbstractSpinBox*>{radius_, ring_count_}) {
+        connect(s, &QAbstractSpinBox::editingFinished, this, [this] { ++panel_session_; });
+    }
+    // A drag on the profile or a paint stroke is one step, committed on release.
+    connect(profile, &RingProfileWidget::edited, this, [this](const QString& text) { commit_panel_edit(text); });
+    connect(canvas_, &KernelCanvas::edited, this, [this](const QString& text) { commit_panel_edit(text); });
     const auto brush_changed = [this] {
         canvas_->set_brush(kernel_brush_radius_->value(), static_cast<float>(kernel_brush_strength_->value()),
                            ring_brush_->isChecked());
@@ -498,7 +747,10 @@ QWidget* MainWindow::build_kernel_panel() {
     connect(kernel_brush_radius_, &QDoubleSpinBox::valueChanged, this, brush_changed);
     connect(kernel_brush_strength_, &QDoubleSpinBox::valueChanged, this, brush_changed);
     connect(ring_brush_, &QCheckBox::toggled, this, brush_changed);
-    connect(clear_paint, &QPushButton::clicked, kernel_, &KernelModel::clear_paint);
+    connect(clear_paint, &QPushButton::clicked, this, [this] {
+        kernel_->clear_paint();
+        commit_panel_edit(tr("Clear kernel paint"));
+    });
     brush_changed();
     return panel;
 }
@@ -567,16 +819,30 @@ QWidget* MainWindow::build_simulation_panel() {
     auto* seed_buttons = new QHBoxLayout;
     seed_buttons->addWidget(reset);
     seed_buttons->addWidget(impulse);
+    nutrient_start_ = new QComboBox;
+    nutrient_start_->addItems({tr("Uniform"), tr("Random"), tr("Gradient (left to right)")});
+    nutrient_start_->setToolTip(tr("How the nutrient N, the second state field, starts on Reset: the level "
+                                   "everywhere, random values up to it (from the random seed), or rising from 0 "
+                                   "at the left edge to it at the right. Only rules with Nutrient nodes read it."));
+    nutrient_level_ = make_double(0.0, 1.0, 0.05, 4, 1.0);
+    nutrient_level_->setToolTip(nutrient_start_->toolTip());
     world_brush_radius_ = make_int(0, 64, 4);
     world_brush_value_ = make_double(0.0, 1.0, 0.1, 2, 1.0);
+    world_brush_field_ = new QComboBox;
+    world_brush_field_->addItems({tr("Density A"), tr("Nutrient N")});
+    world_brush_field_->setToolTip(tr("The state field left drag paints into (shift + drag sets it to 0)"));
     world_form->addRow(tr("Size"), world_size_);
     world_form->addRow(tr("Seed"), seed_);
     world_form->addRow(tr("Random seed"), random_seed_);
+    world_form->addRow(tr("Nutrient start"), nutrient_start_);
+    world_form->addRow(tr("Nutrient level"), nutrient_level_);
     world_form->addRow(seed_buttons);
+    world_form->addRow(tr("Paint field"), world_brush_field_);
     world_form->addRow(tr("Paint radius"), world_brush_radius_);
     world_form->addRow(tr("Paint value"), world_brush_value_);
-    auto* hint = new QLabel(tr("In the view: left drag paints, shift + drag erases, right drag pans, "
-                               "wheel zooms, F refits."));
+    auto* hint = new QLabel(tr("In the view: left drag paints, shift + drag erases, alt + click inspects a cell, "
+                               "right drag pans, wheel zooms, F refits. Seed and nutrient settings apply on "
+                               "Reset."));
     hint->setWordWrap(true);
     world_form->addRow(hint);
     layout->addWidget(world_box);
@@ -589,12 +855,23 @@ QWidget* MainWindow::build_simulation_panel() {
     auto* life = new QPushButton(tr("Game of Life (glider)"));
     life->setToolTip(tr("Conway's B3/S23 as a node-graph rule: raw 8-neighbor Moore kernel, a glider in a "
                         "128 × 128 world. Restore Orbium returns to Lenia."));
+    auto* trail = new QPushButton(tr("Nutrient trail (Density + Nutrient)"));
+    trail->setToolTip(tr("Two interacting state fields: Orbium consumes a nutrient field as it glides, leaving a "
+                         "depleted trail that slowly recovers, and grows less where the nutrient is low. Both "
+                         "fields update together each generation. Restore Orbium returns to plain Lenia."));
+    auto* short_long = new QPushButton(tr("Short / long range (two kernels)"));
+    short_long->setToolTip(tr("Two Kernel K nodes convolve the density: a cell grows where its short-range "
+                              "average beats its long-range one. Random noise settles into spots and labyrinths. "
+                              "Select a Convolve node to see its U in the Neighborhood view. Restore Orbium "
+                              "returns to Lenia."));
     auto* load = new QPushButton(tr("Load pattern file…"));
     attribution_ = new QLabel;
     attribution_->setWordWrap(true);
     attribution_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     preset_layout->addWidget(orbium);
     preset_layout->addWidget(life);
+    preset_layout->addWidget(trail);
+    preset_layout->addWidget(short_long);
     preset_layout->addWidget(load);
     preset_layout->addWidget(attribution_);
     layout->addWidget(preset_box);
@@ -602,7 +879,7 @@ QWidget* MainWindow::build_simulation_panel() {
     auto* view_box = new QGroupBox(tr("View"));
     auto* view_form = new QFormLayout(view_box);
     field_ = new QComboBox;
-    field_->addItems({tr("Density A"), tr("Neighborhood U = K ∗ A"), tr("Growth G(U)")});
+    field_->addItems({tr("Density A"), tr("Neighborhood U = K ∗ A"), tr("Growth G(U)"), tr("Nutrient N")});
     palette_ = new QComboBox;
     palette_->addItems(palette_names());
     lo_ = make_double(-100.0, 100.0, 0.01, 4, 0.0);
@@ -625,13 +902,30 @@ QWidget* MainWindow::build_simulation_panel() {
     display_note_->setWordWrap(true);
     display_note_->setVisible(false);
     view_form->addRow(display_note_);
+    auto* inspect = new QPushButton(tr("Inspect fields"));
+    inspect->setToolTip(tr("Read both state fields back from the GPU once and show their range, mean and total "
+                           "(alt + click a cell in the view for its values). Playback never reads them back."));
+    inspection_ = new QLabel(tr("Not inspected yet"));
+    inspection_->setWordWrap(true);
+    inspection_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    view_form->addRow(inspect);
+    view_form->addRow(inspection_);
     layout->addWidget(view_box);
     layout->addStretch();
 
+    // push_growth first, then the undo step (connections run in order). Programmatic changes
+    // (patterns, experiments, undo itself) block these signals and push_growth directly.
     for (QDoubleSpinBox* s : {mu_, sigma_, dt_}) {
         connect(s, &QDoubleSpinBox::valueChanged, this, &MainWindow::push_growth);
+        connect(s, &QDoubleSpinBox::editingFinished, this, [this] { ++panel_session_; });
     }
+    connect(mu_, &QDoubleSpinBox::valueChanged, this, [this] { commit_panel_edit(tr("Growth μ"), QStringLiteral("mu")); });
+    connect(sigma_, &QDoubleSpinBox::valueChanged, this,
+            [this] { commit_panel_edit(tr("Growth σ"), QStringLiteral("sigma")); });
+    connect(dt_, &QDoubleSpinBox::valueChanged, this, [this] { commit_panel_edit(tr("Growth dt"), QStringLiteral("dt")); });
     connect(growth_function_, &QComboBox::currentIndexChanged, this, &MainWindow::push_growth);
+    connect(growth_function_, &QComboBox::currentIndexChanged, this,
+            [this] { commit_panel_edit(tr("Growth function")); });
     connect(run_, &QPushButton::toggled, this, &MainWindow::set_running);
     connect(step, &QPushButton::clicked, this, &MainWindow::step_once);
     connect(steps_per_frame_, &QSpinBox::valueChanged, view_, &LeniaView::set_steps_per_frame);
@@ -655,8 +949,13 @@ QWidget* MainWindow::build_simulation_panel() {
     connect(impulse, &QPushButton::clicked, this, &MainWindow::seed_impulse);
     connect(world_brush_radius_, &QSpinBox::valueChanged, this, &MainWindow::push_brushes);
     connect(world_brush_value_, &QDoubleSpinBox::valueChanged, this, &MainWindow::push_brushes);
+    connect(world_brush_field_, &QComboBox::currentIndexChanged, this, &MainWindow::push_brushes);
     connect(orbium, &QPushButton::clicked, this, &MainWindow::restore_orbium);
     connect(life, &QPushButton::clicked, this, [this] { load_life(lenia::GraphPreset::GameOfLife); });
+    connect(trail, &QPushButton::clicked, this, &MainWindow::load_nutrient_trail);
+    connect(short_long, &QPushButton::clicked, this, &MainWindow::load_short_long);
+    connect(inspect, &QPushButton::clicked, this, [this] { inspect_fields(); });
+    connect(view_, &LeniaView::cell_probed, this, [this](int x, int y) { inspect_fields(QPoint(x, y)); });
     connect(load, &QPushButton::clicked, this, &MainWindow::load_pattern);
     connect(field_, &QComboBox::currentIndexChanged, this, [this] {
         sync_view_controls();
@@ -742,20 +1041,19 @@ void MainWindow::push_view() { view_->set_view(view_settings_[static_cast<std::s
 
 void MainWindow::push_brushes() {
     view_->set_brush(world_brush_radius_->value(), static_cast<float>(world_brush_value_->value()));
+    view_->set_brush_field(static_cast<BrushField>(world_brush_field_->currentIndex()));
 }
 
 void MainWindow::reset_world() {
     const int size = world_size_->currentData().toInt();
     const int seed = seed_->currentIndex();
-    if (seed == SeedImpulse) {
-        if (view_->world_size() != QSize(size, size)) view_->upload_world(lenia::Grid(size, size, 0.0f));
-        view_->seed_impulse();
-        update_preview_context();
-        return;
-    }
+    const lenia::NutrientSeed nutrient{static_cast<lenia::NutrientStart>(nutrient_start_->currentIndex()),
+                                       static_cast<float>(nutrient_level_->value())};
 
     lenia::Grid world(static_cast<std::size_t>(size), static_cast<std::size_t>(size), 0.0f);
-    if (seed == SeedPattern && pattern_) {
+    if (seed == SeedImpulse) {
+        world.at(world.width / 2, world.height / 2) = 1.0f; // as LeniaView::seed_impulse
+    } else if (seed == SeedPattern && pattern_) {
         lenia::stamp_pattern(world, pattern_->cells, world.width / 2, world.height / 2);
     } else if (seed == SeedPattern) {
         statusBar()->showMessage(tr("No pattern loaded; seeded a random square instead"), 5000);
@@ -769,7 +1067,7 @@ void MainWindow::reset_world() {
             for (std::size_t x = start; x < start + side; ++x) world.at(x, y) = uniform(rng);
         }
     }
-    view_->upload_world(world);
+    view_->upload_world(world, lenia::seed_nutrient(nutrient, size, random_seed_->value()), 0);
     update_preview_context();
 }
 
@@ -805,17 +1103,30 @@ void MainWindow::restore_orbium() {
     graph_ = lenia::make_preset(lenia::GraphPreset::Idle);
     node_editor_->canvas()->graph_replaced();
     view_->inputs_changed();
-    if (life_loaded_) {
-        // Undo the Life experiment's 128 world and binary display.
+    if (life_loaded_ || short_long_loaded_) {
+        // Undo the Life experiment's 128 world and binary display, or the two-kernel demo's.
         life_loaded_ = false;
+        short_long_loaded_ = false;
         const QSignalBlocker b(world_size_);
         world_size_->setCurrentIndex(world_size_->findData(256));
         for (std::size_t i = 0; i < view_settings_.size(); ++i) view_settings_[i] = default_view(static_cast<Field>(i));
         sync_view_controls();
         push_view();
     }
-    if (!apply_pattern(std::move(p), tr("Restore Orbium"))) return;
-    run_->setChecked(true);
+    if (trail_loaded_) {
+        // Undo the nutrient trail demo's display: the panel's density view again.
+        trail_loaded_ = false;
+        display_graph_ = lenia::make_display_preset(lenia::DisplayPreset::Panel);
+        display_editor_->canvas()->graph_replaced();
+        display_graph_changed();
+        const QSignalBlocker b(field_);
+        field_->setCurrentIndex(static_cast<int>(Field::Density));
+        sync_view_controls();
+        push_view();
+    }
+    const bool applied = apply_pattern(std::move(p), tr("Restore Orbium"));
+    reset_history(); // the graph was replaced even if the pattern was not
+    if (applied) run_->setChecked(true);
 }
 
 void MainWindow::load_pattern() {
@@ -864,6 +1175,8 @@ bool MainWindow::apply_pattern(lenia::Pattern p, const QString& title) {
         seed_->setCurrentIndex(SeedPattern);
     }
     reset_world();
+    // A new creature and world: the old steps describe another setup.
+    reset_history();
     return true;
 }
 
@@ -895,6 +1208,8 @@ lenia::Project MainWindow::capture_project() const {
     p.world_size = world_size_->currentData().toInt();
     p.seed = static_cast<lenia::SeedKind>(seed_->currentIndex());
     p.random_seed = random_seed_->value();
+    p.nutrient = {static_cast<lenia::NutrientStart>(nutrient_start_->currentIndex()),
+                  static_cast<float>(nutrient_level_->value())};
     p.pattern = pattern_;
     p.field = static_cast<lenia::DisplayField>(field_->currentIndex());
     for (std::size_t i = 0; i < view_settings_.size(); ++i) {
@@ -934,14 +1249,23 @@ QString MainWindow::check_project(const lenia::Project& p) const {
         if (!in_range(lo_, r.lo)) return range_error(tr("Display low"), lo_, r.lo);
         if (!in_range(hi_, r.hi)) return range_error(tr("Display high"), hi_, r.hi);
     }
+    // The level reseeds the world, so it must survive the spin box exactly.
+    const double scale = std::pow(10.0, nutrient_level_->decimals());
+    if (static_cast<float>(std::round(p.nutrient.level * scale) / scale) != p.nutrient.level) {
+        return tr("Nutrient level %1 has more than %2 decimals, which the workbench cannot hold exactly.")
+            .arg(static_cast<double>(p.nutrient.level))
+            .arg(nutrient_level_->decimals());
+    }
     return {};
 }
 
-void MainWindow::apply_project(lenia::Project p, const lenia::Grid* world, std::uint64_t generation) {
+void MainWindow::apply_project(lenia::Project p, const lenia::WorldState* world, std::uint64_t generation) {
     // Pause first, so nothing steps between the reset below and the user seeing generation 0
     // (or the snapshot's generation).
     run_->setChecked(false);
     life_loaded_ = false;
+    trail_loaded_ = false;
+    short_long_loaded_ = false;
 
     kernel_->restore(p.kernel, p.normalization, p.paint); // validated by parse_project
     sync_kernel_controls();
@@ -977,19 +1301,23 @@ void MainWindow::apply_project(lenia::Project p, const lenia::Grid* world, std::
     display_graph_changed();
 
     {
-        const QSignalBlocker b1(world_size_), b2(seed_), b3(random_seed_);
+        const QSignalBlocker b1(world_size_), b2(seed_), b3(random_seed_), b4(nutrient_start_), b5(nutrient_level_);
         world_size_->setCurrentIndex(world_size_->findData(p.world_size));
         seed_->setCurrentIndex(static_cast<int>(p.seed));
         random_seed_->setValue(p.random_seed);
+        nutrient_start_->setCurrentIndex(static_cast<int>(p.nutrient.start));
+        nutrient_level_->setValue(p.nutrient.level);
     }
     if (world) {
         // The snapshot's world as it was: generation, kernel warp, rule and display all follow
         // from the generation, so the next step computes what the saved session would have.
-        view_->upload_world(*world, generation);
+        view_->upload_world(world->density, world->nutrient, generation);
         update_preview_context();
     } else {
         reset_world();
     }
+    // Another experiment or snapshot: its undo history starts here, empty.
+    reset_history();
 }
 
 QString MainWindow::open_experiment_file(const QString& path) {
@@ -1102,7 +1430,8 @@ QString MainWindow::open_snapshot_file(const QString& path) {
     error = check_project(snapshot->project);
     if (!error.isEmpty()) return error;
 
-    apply_project(std::move(snapshot->project), &snapshot->density, snapshot->generation);
+    const lenia::WorldState world{std::move(snapshot->density), std::move(snapshot->nutrient)};
+    apply_project(std::move(snapshot->project), &world, snapshot->generation);
     // The experiment came from a snapshot: Save experiment asks where to put it.
     project_path_.clear();
     document_name_ = QFileInfo(path).fileName();
@@ -1130,6 +1459,7 @@ void MainWindow::save_snapshot_file(const QString& path, std::function<void(cons
         snapshot->project = capture_project();
         snapshot->generation = c.generation;
         snapshot->density = c.density;
+        snapshot->nutrient = c.nutrient;
         QTimer::singleShot(0, this, [this, path, report, snapshot] { report(write_snapshot_file(path, *snapshot)); });
     });
 }
@@ -1196,6 +1526,8 @@ void MainWindow::save_snapshot_as() {
 }
 
 void MainWindow::set_playing(bool playing) { run_->setChecked(playing); }
+
+bool MainWindow::playing() const { return run_->isChecked(); }
 
 void MainWindow::update_title() {
     const QString base = tr("Lenia kernel workbench");

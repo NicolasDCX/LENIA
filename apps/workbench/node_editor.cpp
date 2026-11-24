@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <stdexcept>
 #include <vector>
 
 namespace workbench {
@@ -61,6 +62,8 @@ QColor type_color(PortType t) {
     case PortType::Environment: return QColor(120, 200, 100);
     case PortType::Cell: return QColor(228, 108, 170);
     case PortType::Color: return QColor(235, 214, 90);
+    case PortType::Field: return QColor(110, 150, 240);
+    case PortType::ConvKernel: return QColor(60, 160, 255);
     }
     return kText;
 }
@@ -69,7 +72,7 @@ QColor type_color(PortType t) {
 // rule nodes, or display nodes).
 bool is_value_node(NodeKind k) {
     return k == NodeKind::Time || k == NodeKind::Oscillator || k == NodeKind::Constant || k == NodeKind::Kernel ||
-           k == NodeKind::Environment;
+           k == NodeKind::ConvKernel || k == NodeKind::Environment;
 }
 
 QColor kind_color(NodeKind k) {
@@ -78,6 +81,7 @@ QColor kind_color(NodeKind k) {
     case NodeKind::Oscillator:
     case NodeKind::Constant: return type_color(PortType::Value);
     case NodeKind::Kernel: return type_color(PortType::Kernel);
+    case NodeKind::ConvKernel: return type_color(PortType::ConvKernel);
     case NodeKind::Environment: return type_color(PortType::Environment);
     case NodeKind::Output:
     case NodeKind::View: return QColor(170, 130, 230);
@@ -92,6 +96,8 @@ double preview_height(NodeKind k) {
     switch (k) {
     case NodeKind::Oscillator: return 44.0;
     case NodeKind::Kernel: return 64.0;
+    case NodeKind::ConvKernel: return 72.0;
+    case NodeKind::Convolve: return 22.0;
     case NodeKind::Environment: return 72.0;
     case NodeKind::Growth: return 48.0;
     case NodeKind::Life: return 22.0;
@@ -129,10 +135,11 @@ void paint_ramp(QPainter& p, const std::vector<lenia::RampStop>& stops, QRectF a
 // Stop editor for a Color ramp node: the gradient with a handle per stop. Drag a handle to move
 // the stop, double-click it to pick its color, right-click it to remove it (at least two stay);
 // double-click the gradient to add a stop with the color already there.
+// `changed` follows every change, `edited` ends each gesture (a drag: once, on release).
 class RampEditor : public QWidget {
 public:
-    RampEditor(lenia::Graph* graph, int node, std::function<void()> changed)
-        : graph_(graph), node_(node), changed_(std::move(changed)) {
+    RampEditor(lenia::Graph* graph, int node, std::function<void()> changed, std::function<void(const QString&)> edited)
+        : graph_(graph), node_(node), changed_(std::move(changed)), edited_(std::move(edited)) {
         setMinimumHeight(56);
         setMouseTracking(true);
         setToolTip(QObject::tr("Drag a stop to move it · double-click a stop to recolor it · double-click the bar "
@@ -170,6 +177,7 @@ protected:
                 s.erase(s.begin() + j);
                 active_ = -1;
                 write(s);
+                edited_(QObject::tr("Remove color stop"));
             }
         }
         update();
@@ -183,7 +191,10 @@ protected:
         write(s);
     }
 
-    void mouseReleaseEvent(QMouseEvent*) override { dragging_ = false; }
+    void mouseReleaseEvent(QMouseEvent*) override {
+        if (dragging_) edited_(QObject::tr("Move color stop")); // the whole drag: one step
+        dragging_ = false;
+    }
 
     void mouseDoubleClickEvent(QMouseEvent* e) override {
         if (e->button() != Qt::LeftButton) return;
@@ -196,11 +207,13 @@ protected:
             s[static_cast<std::size_t>(j)].rgb = {static_cast<float>(c.redF()), static_cast<float>(c.greenF()),
                                                   static_cast<float>(c.blueF())};
             write(s);
+            edited_(QObject::tr("Recolor stop"));
         } else if (s.size() < static_cast<std::size_t>(lenia::ramp_node::kMaxStops)) {
             const float t = t_of(e->position().x());
             s.push_back({t, lenia::sample_ramp(sorted(s), t)});
             active_ = static_cast<int>(s.size()) - 1;
             write(s);
+            edited_(QObject::tr("Add color stop"));
         }
     }
 
@@ -245,6 +258,7 @@ private:
     lenia::Graph* graph_;
     int node_;
     std::function<void()> changed_;
+    std::function<void(const QString&)> edited_;
     int active_ = -1;
     bool dragging_ = false;
 };
@@ -298,8 +312,19 @@ void NodeCanvas::wire_lenia_rule() {
         return;
     }
     emit graph_changed();
+    emit edited(tr("Wire the Lenia rule"));
     frame_all();
     emit message(tr("Wired the built-in Lenia update as nodes: same result, now editable"));
+}
+
+QPointF NodeCanvas::port_widget_pos(int node, int port, bool output) const {
+    const lenia::Node* n = graph_->node(node);
+    return n ? port_pos(*n, port, output) * zoom_ + pan_ : QPointF();
+}
+
+QPointF NodeCanvas::title_widget_pos(int node) const {
+    const lenia::Node* n = graph_->node(node);
+    return n ? QPointF(n->x + kNodeWidth / 2, n->y + kHeader / 2) * zoom_ + pan_ : QPointF();
 }
 
 void NodeCanvas::select_node(int id) {
@@ -504,6 +529,9 @@ void NodeCanvas::draw_node(QPainter& p, const lenia::Node& n) {
         } else if (port.type == PortType::Cell) {
             p.setPen(kDim);
             p.drawText(rr, Qt::AlignLeft | Qt::AlignVCenter, tr("per cell"));
+        } else if (port.type == PortType::Field) {
+            p.setPen(kDim);
+            p.drawText(rr, Qt::AlignLeft | Qt::AlignVCenter, tr("whole field"));
         }
         bool linked = false;
         for (const lenia::Link& l : graph_->links()) linked = linked || (l.from_node == n.id && l.from_port == j);
@@ -529,6 +557,8 @@ void NodeCanvas::draw_node(QPainter& p, const lenia::Node& n) {
         switch (n.kind) {
         case NodeKind::Oscillator: draw_oscillator_preview(p, n, area); break;
         case NodeKind::Kernel: draw_kernel_preview(p, n, area); break;
+        case NodeKind::ConvKernel: draw_conv_kernel_preview(p, n, area); break;
+        case NodeKind::Convolve: draw_convolve_preview(p, n, area); break;
         case NodeKind::Environment: draw_environment_preview(p, n, area); break;
         case NodeKind::Growth: draw_growth_preview(p, n, area); break;
         case NodeKind::Life: draw_life_preview(p, n, area); break;
@@ -724,6 +754,9 @@ QString NodeCanvas::input_text(const lenia::Node& n, int port, bool linked) cons
         if (!linked && spec.param < 0) return tr("gen %1").arg(generation_);
         return number(lenia::input_value(*graph_, n.id, port, generation_, panel_growth_));
     case PortType::Cell: {
+        if (n.kind == NodeKind::Output && port == lenia::output_node::NutrientIn) {
+            return linked ? tr("rule") : tr("kept");
+        }
         if (n.kind == NodeKind::Output) return linked ? tr("rule") : tr("built-in Lenia");
         if (const lenia::Link* l = graph_->link_into(n.id, port)) {
             const lenia::Node* from = graph_->node(l->from_node);
@@ -755,8 +788,94 @@ QString NodeCanvas::input_text(const lenia::Node& n, int port, bool linked) cons
     case PortType::Color:
         if (linked) return tr("linked");
         return n.kind == NodeKind::View ? tr("panel display") : tr("black");
+    case PortType::Field: {
+        const lenia::Link* l = graph_->link_into(n.id, port);
+        const lenia::Node* from = l ? graph_->node(l->from_node) : nullptr;
+        if (!from) return tr("= A (density)");
+        return from->kind == NodeKind::Nutrient ? tr("N (nutrient)") : tr("A (density)");
+    }
+    case PortType::ConvKernel: {
+        const lenia::Link* l = graph_->link_into(n.id, port);
+        if (!l) return tr("missing");
+        const lenia::ConvKernel k = lenia::node_conv_kernel(*graph_, l->from_node);
+        return tr("R %1").arg(k.shape.radius);
+    }
     }
     return {};
+}
+
+void NodeCanvas::draw_conv_kernel_preview(QPainter& p, const lenia::Node& n, QRectF area) {
+    const lenia::ConvKernel k = lenia::node_conv_kernel(*graph_, n.id);
+    lenia::Grid weights;
+    QString error;
+    try {
+        weights = lenia::make_conv_kernel(k);
+    } catch (const std::invalid_argument& e) {
+        error = QString::fromUtf8(e.what());
+    }
+    if (!error.isEmpty()) {
+        p.setPen(QColor(255, 110, 110));
+        p.drawText(area.adjusted(6, 2, -6, -2), Qt::AlignLeft | Qt::AlignVCenter | Qt::TextWordWrap, error);
+        return;
+    }
+    // The weights as a square thumbnail, red positive and blue negative, scaled by the largest.
+    float peak = 0.0f;
+    for (const float w : weights.cells) peak = std::max(peak, std::fabs(w));
+    const int side = static_cast<int>(weights.width);
+    QImage image(side, side, QImage::Format_RGB32);
+    for (int y = 0; y < side; ++y) {
+        for (int x = 0; x < side; ++x) {
+            const float w = weights.at(static_cast<std::size_t>(x), static_cast<std::size_t>(y));
+            image.setPixel(x, y, palette_color(RedBlue, peak > 0.0f ? 0.5f + 0.5f * w / peak : 0.5f).rgb());
+        }
+    }
+    const double s = area.height() - 4;
+    const QRectF img_rect(area.left() + 4, area.top() + 2, s, s);
+    p.drawImage(img_rect, image);
+    // The kernel's middle: where an unshifted kernel is centered.
+    p.setPen(QPen(kSelected, 1.0, Qt::DotLine));
+    p.drawLine(QPointF(img_rect.center().x(), img_rect.top()), QPointF(img_rect.center().x(), img_rect.bottom()));
+    p.drawLine(QPointF(img_rect.left(), img_rect.center().y()), QPointF(img_rect.right(), img_rect.center().y()));
+
+    const lenia::KernelStats stats = lenia::kernel_stats(weights);
+    int users = 0;
+    for (const lenia::Link& l : graph_->links()) users += l.from_node == n.id ? 1 : 0;
+    p.setPen(kText);
+    const QRectF text(img_rect.right() + 8, area.top() + 2, area.right() - img_rect.right() - 10, area.height() - 4);
+    QString shift;
+    if (k.shift_x != 0.0f || k.shift_y != 0.0f) {
+        shift = tr("\nshift (%1, %2)").arg(static_cast<double>(k.shift_x)).arg(static_cast<double>(k.shift_y));
+    }
+    p.drawText(text, Qt::AlignLeft | Qt::AlignTop,
+               tr("%1 × %1, Σ %2%3\n%4")
+                   .arg(side)
+                   .arg(stats.sum, 0, 'f', 3)
+                   .arg(shift)
+                   .arg(users == 0 ? tr("unused") : tr("feeds %n Convolve", nullptr, users)));
+}
+
+void NodeCanvas::draw_convolve_preview(QPainter& p, const lenia::Node& n, QRectF area) {
+    // What the rule makes of the node, as compile_rule sees it.
+    QString text;
+    bool error = false;
+    if (!graph_->link_into(n.id, lenia::convolve_node::KernelIn)) {
+        text = tr("Link a Kernel K into Kernel");
+        error = true;
+    } else {
+        const lenia::RuleCompile c = lenia::compile_rule(*graph_, generation_, panel_growth_);
+        const bool used = std::any_of(c.convolve_registers.begin(), c.convolve_registers.end(),
+                                      [&](const auto& r) { return r.first == n.id; });
+        if (!c.error.empty()) {
+            text = tr("Rule does not compile");
+            error = true;
+        } else if (used) {
+            text = n.id == selected_node_ ? tr("U shown in Neighborhood view") : tr("Select to preview U");
+        } else {
+            text = tr("Not used by the rule");
+        }
+    }
+    p.setPen(error ? QColor(255, 110, 110) : kText);
+    p.drawText(area.adjusted(6, 0, -6, 0), Qt::AlignLeft | Qt::AlignVCenter, text);
 }
 
 void NodeCanvas::draw_output_preview(QPainter& p, QRectF area) {
@@ -775,10 +894,17 @@ void NodeCanvas::draw_output_preview(QPainter& p, QRectF area) {
                       ? tr("Environment: ×%1").arg(f.environment.strength, 0, 'f', 4)
                       : tr("Environment: off");
     bool error = false;
-    if (f.rule_connected) {
+    if (f.rule_connected || f.nutrient_connected) {
         const lenia::RuleCompile c = lenia::compile_rule(*graph_, generation_, panel_growth_);
         error = !c.error.empty();
-        rule = error ? tr("Rule: too large, not stepping") : tr("Rule: wired, %1 ops per cell").arg(c.program.ops.size());
+        if (!f.rule_connected) {
+            rule = tr("Rule: Next nutrient needs Next state");
+        } else if (error) {
+            rule = tr("Rule: too large, not stepping");
+        } else {
+            rule = f.nutrient_connected ? tr("Rule: A and N, %1 ops per cell").arg(c.program.ops.size())
+                                        : tr("Rule: wired, %1 ops per cell").arg(c.program.ops.size());
+        }
         env = tr("Environment: via Field outputs");
     }
     const QRectF text = area.adjusted(6, 3, -6, -3);
@@ -815,6 +941,8 @@ void NodeCanvas::mousePressEvent(QMouseEvent* e) {
         if (!port.output) {
             // Picking up a linked input detaches the link and keeps dragging it from its source.
             if (const lenia::Link* l = graph_->link_into(port.node, port.port)) {
+                link_drag_before_ = *graph_;
+                detached_ = *l;
                 drag_from_ = {l->from_node, l->from_port, true};
                 graph_->disconnect(port.node, port.port);
                 set_selected_link(std::nullopt);
@@ -870,8 +998,13 @@ void NodeCanvas::mouseMoveEvent(QMouseEvent* e) {
 }
 
 void NodeCanvas::mouseReleaseEvent(QMouseEvent* e) {
-    if (drag_ == Drag::Link) {
+    // The whole drag is one undo step, committed here (a detached link included).
+    const Drag ended = drag_;
+    drag_ = Drag::None;
+    hover_port_ = {};
+    if (ended == Drag::Link) {
         const PortRef target = port_at(to_scene(e->position()));
+        bool linked = false;
         if (target.valid() && target != drag_from_) {
             const PortRef out = drag_from_.output ? drag_from_ : target;
             const PortRef in = drag_from_.output ? target : drag_from_;
@@ -879,14 +1012,23 @@ void NodeCanvas::mouseReleaseEvent(QMouseEvent* e) {
                 out.output && !in.output ? graph_->connect(out.node, out.port, in.node, in.port)
                                          : lenia::ConnectResult::BadPort;
             if (r == lenia::ConnectResult::Ok) {
+                linked = true;
+                // Dropped back where it was picked up: the graph as before, links in order.
+                if (detached_ && *detached_ == lenia::Link{out.node, out.port, in.node, in.port}) {
+                    *graph_ = *link_drag_before_;
+                }
                 emit graph_changed();
             } else {
                 emit message(tr("Cannot link: %1").arg(QString::fromLatin1(lenia::describe(r))));
             }
         }
+        const bool detached = detached_.has_value();
+        link_drag_before_.reset();
+        detached_.reset();
+        if (linked || detached) emit edited(linked ? tr("Link") : tr("Unlink"));
+    } else if (ended == Drag::Move) {
+        emit edited(tr("Move node")); // no step if it did not move
     }
-    drag_ = Drag::None;
-    hover_port_ = {};
     update();
 }
 
@@ -920,6 +1062,7 @@ void NodeCanvas::contextMenuEvent(QContextMenuEvent* e) {
         menu.addAction(tr("Unlink this input"), this, [this, port] {
             graph_->disconnect(port.node, port.port);
             emit graph_changed();
+            emit edited(tr("Unlink"));
             update();
         });
     } else if (id >= 0) {
@@ -939,6 +1082,7 @@ void NodeCanvas::contextMenuEvent(QContextMenuEvent* e) {
             const auto count = static_cast<int>(lenia::node_spec(node->kind).inputs.size());
             for (int i = 0; i < count; ++i) graph_->disconnect(id, i);
             emit graph_changed();
+            emit edited(tr("Unlink all inputs"));
             update();
         });
     } else if (link) {
@@ -947,6 +1091,7 @@ void NodeCanvas::contextMenuEvent(QContextMenuEvent* e) {
             graph_->disconnect(l.to_node, l.to_port);
             set_selected_link(std::nullopt);
             emit graph_changed();
+            emit edited(tr("Unlink"));
         });
     } else {
         const bool display = graph_->domain() == lenia::GraphDomain::Display;
@@ -967,6 +1112,7 @@ void NodeCanvas::add_node_at(NodeKind kind, QPointF scene) {
     const int id = graph_->add_node(kind, static_cast<float>(scene.x()), static_cast<float>(scene.y()));
     select_node(id);
     emit graph_changed();
+    emit edited(tr("Add %1").arg(QString::fromStdString(lenia::node_spec(kind).name)));
     emit message(tr("Added %1: drag from its ports to link it").arg(QString::fromStdString(lenia::node_spec(kind).name)));
 }
 
@@ -985,10 +1131,12 @@ void NodeCanvas::remove_node(int id) {
                          .arg(QString::fromStdString(lenia::node_spec(n->kind).name)));
         return;
     }
+    const QString name = QString::fromStdString(lenia::node_spec(n->kind).name);
     graph_->remove_node(id);
     if (selected_node_ == id) select_node(-1);
     if (selected_link_ && (selected_link_->from_node == id || selected_link_->to_node == id)) selected_link_.reset();
     emit graph_changed();
+    emit edited(tr("Delete %1").arg(name));
     update();
 }
 
@@ -997,6 +1145,7 @@ void NodeCanvas::delete_selection() {
         graph_->disconnect(selected_link_->to_node, selected_link_->to_port);
         set_selected_link(std::nullopt);
         emit graph_changed();
+        emit edited(tr("Unlink"));
     } else if (selected_node_ >= 0) {
         remove_node(selected_node_);
     }
@@ -1018,7 +1167,25 @@ void NodeCanvas::graph_replaced() {
     select_node(-1);
     drag_ = Drag::None;
     hover_port_ = {};
+    link_drag_before_.reset();
+    detached_.reset();
     frame_all();
+}
+
+void NodeCanvas::graph_restored() {
+    drag_ = Drag::None;
+    hover_port_ = {};
+    link_drag_before_.reset();
+    detached_.reset();
+    if (selected_link_ && std::find(graph_->links().begin(), graph_->links().end(), *selected_link_) ==
+                              graph_->links().end()) {
+        selected_link_.reset();
+    }
+    // Always signalled: the inspector shows the restored parameters.
+    const int keep = graph_->node(selected_node_) ? selected_node_ : -1;
+    selected_node_ = -2;
+    select_node(keep);
+    update();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1067,6 +1234,7 @@ NodeEditor::NodeEditor(lenia::Graph* graph, QWidget* parent) : QWidget(parent), 
         presets_->addItem(tr("Panel display (View unlinked, default)"), static_cast<int>(lenia::DisplayPreset::Panel));
         presets_->addItem(tr("Panel display as nodes"), static_cast<int>(lenia::DisplayPreset::WiredPanel));
         presets_->addItem(tr("Density + pulsing growth overlay"), static_cast<int>(lenia::DisplayPreset::GrowthOverlay));
+        presets_->addItem(tr("Density over nutrient"), static_cast<int>(lenia::DisplayPreset::DensityNutrient));
         presets_->setToolTip(tr("Display examples replace the display graph only; the simulation is untouched."));
     } else {
         presets_->addItem(tr("Lenia rule, idle (default Orbium)"), static_cast<int>(lenia::GraphPreset::Idle));
@@ -1076,9 +1244,15 @@ NodeEditor::NodeEditor(lenia::Graph* graph, QWidget* parent) : QWidget(parent), 
         presets_->addItem(tr("Game of Life (Life node)"), static_cast<int>(lenia::GraphPreset::GameOfLife));
         presets_->addItem(tr("Game of Life (Compare / Select)"),
                           static_cast<int>(lenia::GraphPreset::GameOfLifeCompare));
+        presets_->addItem(tr("Density + Nutrient trail (two state fields)"),
+                          static_cast<int>(lenia::GraphPreset::NutrientTrail));
+        presets_->addItem(tr("Short / long range (two Kernel K nodes)"),
+                          static_cast<int>(lenia::GraphPreset::ShortLongRange));
         presets_->setToolTip(tr("Lenia examples replace the graph; the world keeps running, press R to replay from "
                                 "generation 0. Game of Life examples load the whole Life setup (Moore kernel, "
-                                "glider) and run it; Restore Orbium returns to Lenia."));
+                                "glider) and run it; the nutrient trail loads Orbium in a nutrient field with its "
+                                "display and runs it; short / long range loads random noise that two kernels turn "
+                                "into spots. Restore Orbium returns to plain Lenia."));
     }
     auto* load = new QPushButton(tr("Load"));
     load->setToolTip(presets_->toolTip());
@@ -1122,6 +1296,7 @@ NodeEditor::NodeEditor(lenia::Graph* graph, QWidget* parent) : QWidget(parent), 
     layout->addWidget(split, 1);
 
     connect(canvas_, &NodeCanvas::graph_changed, this, &NodeEditor::graph_changed);
+    connect(canvas_, &NodeCanvas::edited, this, &NodeEditor::edited);
     connect(canvas_, &NodeCanvas::message, this, &NodeEditor::message);
     connect(canvas_, &NodeCanvas::selection_changed, this, &NodeEditor::rebuild_inspector);
     // Canvas edits (links) change which parameters show "(+ link)". Inspector edits do not
@@ -1138,24 +1313,34 @@ NodeEditor::NodeEditor(lenia::Graph* graph, QWidget* parent) : QWidget(parent), 
         const int id = canvas_->selected_node();
         const lenia::Node* n = graph_->node(id);
         if (!n || lenia::is_sink(n->kind)) return;
+        const QString name = QString::fromStdString(lenia::node_spec(n->kind).name);
         graph_->remove_node(id);
         canvas_->select_node(-1);
         emit graph_changed();
+        emit edited(tr("Delete %1").arg(name));
         canvas_->update();
     });
     rebuild_inspector();
+}
+
+QWidget* NodeEditor::inspector_field(int index) const {
+    if (index < 0 || index >= static_cast<int>(inspector_fields_by_param_.size())) return nullptr;
+    return inspector_fields_by_param_[static_cast<std::size_t>(index)];
 }
 
 void NodeEditor::load_preset(lenia::GraphPreset preset) {
     *graph_ = lenia::make_preset(preset);
     canvas_->graph_replaced();
     emit graph_changed();
+    emit edited(tr("Load example"));
     emit message(tr("Loaded example \"%1\"; R replays it from generation 0").arg(presets_->itemText(
         std::max(0, presets_->findData(static_cast<int>(preset))))));
 }
 
 void NodeEditor::rebuild_inspector() {
     while (inspector_form_->rowCount() > 0) inspector_form_->removeRow(0);
+    inspector_fields_by_param_.clear();
+    ++inspector_session_; // new spin boxes: new undo steps
 
     const int id = canvas_->selected_node();
     const lenia::Node* n = graph_->node(id);
@@ -1180,6 +1365,9 @@ void NodeEditor::rebuild_inspector() {
                "A linked Value input adds its value to the parameter of the same name.\n\n"
                "Cell rule nodes (pink) compute one value per cell; the one wired into Simulation's Next "
                "state is the cell's next state. A linked cell input replaces its parameter.\n\n"
+               "Kernel K nodes define kernels of their own; a Convolve node convolves a field (Density A or "
+               "Nutrient N's Field output) with one, so a rule can use several neighborhoods. Select a "
+               "Convolve node to see its U in the Neighborhood view.\n\n"
                "Everything is a function of the generation: pause, step and reset replay exactly."));
         delete_node_->setVisible(false);
         return;
@@ -1202,7 +1390,7 @@ void NodeEditor::rebuild_inspector() {
             canvas_->update();
             emit graph_changed();
         };
-        auto* ramp = new RampEditor(graph_, id, changed);
+        auto* ramp = new RampEditor(graph_, id, changed, [this](const QString& text) { emit edited(text); });
         inspector_form_->addRow(ramp);
         auto* palette = new QComboBox;
         palette->addItem(tr("Set stops from palette…"));
@@ -1219,6 +1407,7 @@ void NodeEditor::rebuild_inspector() {
             palette->setCurrentIndex(0);
             ramp->update();
             changed();
+            emit edited(tr("Set stops from palette"));
         });
         connect(reverse, &QPushButton::clicked, this, [this, id, ramp, changed] {
             const lenia::Node* node = graph_->node(id);
@@ -1229,6 +1418,7 @@ void NodeEditor::rebuild_inspector() {
             lenia::set_ramp_stops(*graph_, id, s);
             ramp->update();
             changed();
+            emit edited(tr("Reverse stops"));
         });
     }
 
@@ -1249,6 +1439,7 @@ void NodeEditor::rebuild_inspector() {
         inspector_form_->addRow(note);
     }
 
+    inspector_fields_by_param_.assign(spec.params.size(), nullptr);
     for (int i = 0; i < static_cast<int>(spec.params.size()); ++i) {
         // A Color ramp's stops are edited in its RampEditor above.
         if (n->kind == NodeKind::ColorRamp && i >= lenia::ramp_node::Stops) break;
@@ -1271,14 +1462,17 @@ void NodeEditor::rebuild_inspector() {
             for (const std::string& c : ps.choices) combo->addItem(QString::fromStdString(c));
             combo->setCurrentIndex(static_cast<int>(value));
             const bool source = n->kind == NodeKind::Growth && i == lenia::growth_node::Source;
-            connect(combo, &QComboBox::currentIndexChanged, this, [this, id, i, source](int v) {
+            const QString text = tr("Set %1").arg(QString::fromStdString(ps.name));
+            connect(combo, &QComboBox::currentIndexChanged, this, [this, id, i, source, text](int v) {
                 graph_->set_param(id, i, static_cast<float>(v));
                 canvas_->update();
                 emit graph_changed();
+                emit edited(text);
                 // The panel note depends on Source; queued, since rebuilding deletes this combo.
                 if (source) QMetaObject::invokeMethod(this, [this] { rebuild_inspector(); }, Qt::QueuedConnection);
             });
             inspector_form_->addRow(label, combo);
+            inspector_fields_by_param_[static_cast<std::size_t>(i)] = combo;
         } else {
             auto* spin = new QDoubleSpinBox;
             spin->setRange(ps.min, ps.max);
@@ -1286,12 +1480,18 @@ void NodeEditor::rebuild_inspector() {
             spin->setDecimals(ps.decimals);
             spin->setValue(value);
             spin->setKeyboardTracking(false);
-            connect(spin, &QDoubleSpinBox::valueChanged, this, [this, id, i](double v) {
+            // Arrow, wheel and typed steps on this field merge into one undo step until it loses
+            // focus (or Enter): the key names the node, the parameter and this editing session.
+            const QString text = tr("Edit %1").arg(QString::fromStdString(ps.name));
+            connect(spin, &QDoubleSpinBox::valueChanged, this, [this, id, i, text](double v) {
                 graph_->set_param(id, i, static_cast<float>(v));
                 canvas_->update();
                 emit graph_changed();
+                emit edited(text, QStringLiteral("param %1 %2 %3").arg(id).arg(i).arg(inspector_session_));
             });
+            connect(spin, &QDoubleSpinBox::editingFinished, this, [this] { ++inspector_session_; });
             inspector_form_->addRow(label, spin);
+            inspector_fields_by_param_[static_cast<std::size_t>(i)] = spin;
         }
     }
     if (spec.params.empty()) {

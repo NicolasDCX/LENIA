@@ -34,6 +34,9 @@ struct GenerationInputs {
     // The node graph's per-cell rule (at most lenia::kMaxRuleOps ops); null = the built-in
     // Lenia update with `growth` and `environment`, which a rule replaces entirely.
     std::shared_ptr<const lenia::RuleProgram> rule;
+    // A register of `rule` (a Convolve node's U, lenia::RuleCompile::convolve_registers) that the
+    // Neighborhood field shows instead of U; kNoRegister: U.
+    std::uint32_t preview = lenia::kNoRegister;
 };
 
 // Called with the generation about to be computed (the one the step reads from). Must be a
@@ -47,11 +50,12 @@ using InputsProvider = std::function<GenerationInputs(std::uint64_t generation)>
 // as InputsProvider; announce changes with LeniaView::display_changed.
 using DisplayProvider = std::function<std::shared_ptr<const lenia::DisplayProgram>(std::uint64_t generation)>;
 
-// The world's density read back from the GPU by LeniaView::capture_world.
+// The world's state fields read back from the GPU by LeniaView::capture_world.
 struct WorldCapture {
     lenia::Grid density;
     std::uint64_t generation = 0; // the generation `density` is at
-    QString error;                // non-empty: the capture failed and `density` is empty
+    QString error;                // non-empty: the capture failed and the fields are empty
+    lenia::Grid nutrient;         // the same generation's nutrient
 };
 // Called exactly once per capture_world, on the GUI thread. On success it runs inside the frame
 // that read the world back, before anything else can change the setup, so the caller can record
@@ -59,7 +63,10 @@ struct WorldCapture {
 // those, e.g. with QTimer::singleShot).
 using CaptureCallback = std::function<void(const WorldCapture& capture)>;
 
-enum class Field : std::uint32_t { Density = 0, Neighborhood = 1, Growth = 2 };
+enum class Field : std::uint32_t { Density = 0, Neighborhood = 1, Growth = 2, Nutrient = 3 };
+
+// The state field the world brush paints (lenia::WorldState).
+enum class BrushField { Density = 0, Nutrient = 1 };
 
 struct ViewSettings {
     Field field = Field::Density;
@@ -72,15 +79,17 @@ class LeniaRenderer;
 
 // Viewport and simulation in one QVulkanWindow: the world lives in device buffers on the
 // window's device and is stepped by compute dispatches recorded into each frame's command
-// buffer, ahead of the render pass that draws it. Edits (seeds, kernels, painted cells) are
+// buffer, ahead of the render pass that draws it. The world is both state fields
+// (lenia::WorldState): each cell buffer holds the density followed by the nutrient, so a
+// generation updates both at once. Edits (seeds, kernels, painted cells) are
 // queued here and uploaded with vkCmdUpdateBuffer in the next frame. Nothing is read back to
-// the CPU during playback; only capture_world copies the density out, on demand. Kernel, growth, environment and the cell rule come from an InputsProvider queried
+// the CPU during playback; only capture_world copies the fields out, on demand. Kernel, growth, environment and the cell rule come from an InputsProvider queried
 // before every generation's dispatch, so they can change from one generation to the next
 // within a frame. The picture comes from a DisplayProvider queried once per frame (the display
 // graph's program, run per pixel by workbench_view.frag) or, without one, from ViewSettings.
 //
-// Mouse: left drag paints the world with the brush (shift erases), right or middle drag pans,
-// the wheel zooms about the cursor.
+// Mouse: left drag paints the world with the brush (shift erases), alt + left click asks to
+// inspect the cell (cell_probed), right or middle drag pans, the wheel zooms about the cursor.
 class LeniaView : public QVulkanWindow {
     Q_OBJECT
 public:
@@ -88,18 +97,21 @@ public:
 
     QVulkanWindowRenderer* createRenderer() override;
 
-    // Replaces the world (resizing it if needed) and sets the generation counter: 0 for a
-    // reseed, the snapshot's generation when resuming one.
+    // Replaces the density (resizing the world if needed) and sets the generation counter: 0 for
+    // a reseed, the snapshot's generation when resuming one. The nutrient stays as it is (all 0
+    // after a resize); the second form replaces it too (it must be the density's size).
     void upload_world(const lenia::Grid& world, std::uint64_t generation = 0);
-    // Reads the density back at the next frame, after that frame's uploads and steps (so pending
-    // edits are included), and passes it with its generation to `done`. One capture at a time;
+    void upload_world(const lenia::Grid& density, const lenia::Grid& nutrient, std::uint64_t generation);
+    // Reads both fields back at the next frame, after that frame's uploads and steps (so pending
+    // edits are included), and passes them with their generation to `done`. One capture at a time;
     // fails at once (calling `done` before returning) if one is pending or the view is not
     // exposed, and later if the device fails or is reset first.
     void capture_world(CaptureCallback done);
     bool capture_pending() const { return static_cast<bool>(capture_); }
     // Number of completed GPU readbacks (captures) so far; playback alone never adds to it.
     std::uint64_t readback_count() const { return readbacks_; }
-    // Clears the world to a single 1.0 cell in the middle and resets the generation counter.
+    // Clears the density to a single 1.0 cell in the middle and resets the generation counter;
+    // the nutrient stays as it is.
     void seed_impulse();
     void set_inputs(InputsProvider provider);
     // The provider's answers changed (kernel, growth or graph edit): re-analyzes the current
@@ -131,6 +143,7 @@ public:
 
     // Brush for left-drag painting: cells within `radius` get `value` (shift paints 0).
     void set_brush(int radius, float value);
+    void set_brush_field(BrushField field) { brush_field_ = field; }
     void fit_view();
 
     QSize world_size() const { return {world_width_, world_height_}; }
@@ -149,6 +162,8 @@ signals:
     void key_pressed(int key);
     // Key presses with Ctrl held (Ctrl+O, Ctrl+S, …), for the main window's menu shortcuts.
     void shortcut_pressed(const QKeySequence& keys);
+    // Alt + left click on cell (x, y) of the world: the user wants to inspect it.
+    void cell_probed(int x, int y);
 
 protected:
     void keyPressEvent(QKeyEvent* e) override;
@@ -173,9 +188,11 @@ private:
     void finish_capture(WorldCapture capture);
 
     // Edits waiting for the next frame. A world upload or impulse seed supersedes earlier
-    // pokes; pokes are keyed by cell index so the last value written to a cell wins.
+    // pokes; pokes are keyed by buffer index (a density cell, or width * height plus a nutrient
+    // cell) so the last value written to a cell wins.
     struct Pending {
         std::optional<lenia::Grid> world;
+        std::optional<lenia::Grid> nutrient;
         bool impulse = false;
         std::map<std::uint32_t, float> pokes;
         int steps = 0;
@@ -197,6 +214,7 @@ private:
 
     int brush_radius_ = 4;
     float brush_value_ = 1.0f;
+    BrushField brush_field_ = BrushField::Density;
 
     double zoom_ = 1.0;        // 1 fits the world in the window
     QPointF center_{128, 128}; // world cell at the window center

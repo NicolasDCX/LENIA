@@ -57,7 +57,13 @@ struct StepPush {
     float env_offset;
     std::uint32_t rule;    // 1: the Rule buffer gives the next state
     std::uint32_t u_ready; // 1: the Neighborhood buffer already holds U (FFT path)
+    std::uint32_t preview; // rule register shown as the neighborhood, or lenia::kNoRegister
 };
+
+// The kernel buffer (binding 1): the active kernel at 0, up to kMaxKernelSize² weights, then
+// the rule's Convolve kernels (lenia::pack_rule_kernels) at this fixed offset, in floats.
+constexpr std::uint32_t kRuleKernelBase =
+    static_cast<std::uint32_t>(LeniaView::kMaxKernelSize) * LeniaView::kMaxKernelSize;
 
 // fft_convolve.comp: threads per line (local_size_x_id 1) if the device allows them, and its
 // specialization constants (FFT_MAX, id 0, and the threads).
@@ -74,6 +80,17 @@ bool valid_kernel(const lenia::Grid* k) {
     constexpr auto kMax = static_cast<std::size_t>(LeniaView::kMaxKernelSize);
     return k && k->width % 2 == 1 && k->height % 2 == 1 && k->width <= kMax && k->height <= kMax &&
            k->cells.size() == k->width * k->height;
+}
+
+// Fits the Rule buffer and the kernel buffer's space for Convolve kernels.
+bool valid_rule(const lenia::RuleProgram& r) {
+    if (r.ops.size() > lenia::kMaxRuleOps || r.kernels.size() > lenia::kMaxConvolutions) return false;
+    std::size_t weights = 0;
+    for (const lenia::Grid& k : r.kernels) {
+        if (k.width % 2 == 0 || k.height % 2 == 0 || k.cells.size() != k.width * k.height) return false;
+        weights += k.cells.size();
+    }
+    return weights <= lenia::kMaxConvolveWeights;
 }
 
 // Must match the push_constant block in workbench_view.frag.
@@ -261,8 +278,7 @@ void LeniaRenderer::initResources() {
     if (!create_pipelines()) return;
     create_fft_pipeline();
 
-    const VkDeviceSize kernel_bytes =
-        static_cast<VkDeviceSize>(LeniaView::kMaxKernelSize) * LeniaView::kMaxKernelSize * sizeof(float);
+    const VkDeviceSize kernel_bytes = (static_cast<VkDeviceSize>(kRuleKernelBase) + lenia::kMaxConvolveWeights) * sizeof(float);
     const std::vector<float> palettes = palette_table();
     if (!create_buffer(kernel_, kernel_bytes)) return;
     if (!create_buffer(palette_, palettes.size() * sizeof(float))) return;
@@ -478,7 +494,11 @@ void LeniaRenderer::destroy_buffer(Buffer& b) {
 
 bool LeniaRenderer::create_world(int width, int height) {
     const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * sizeof(float);
-    for (Buffer* b : {&cells_[0], &cells_[1], &neighborhood_, &growth_}) {
+    // Cell buffers hold both state fields: the density, then the nutrient.
+    for (Buffer* b : {&cells_[0], &cells_[1]}) {
+        if (!create_buffer(*b, 2 * bytes)) return false;
+    }
+    for (Buffer* b : {&neighborhood_, &growth_}) {
         if (!create_buffer(*b, bytes)) return false;
     }
     width_ = width;
@@ -793,7 +813,9 @@ void LeniaRenderer::startNextFrame() {
 }
 
 bool LeniaRenderer::record_capture(VkCommandBuffer cb) {
-    const VkDeviceSize bytes = static_cast<VkDeviceSize>(width_) * static_cast<VkDeviceSize>(height_) * sizeof(float);
+    // Both state fields: density, then nutrient.
+    const VkDeviceSize bytes =
+        2 * static_cast<VkDeviceSize>(width_) * static_cast<VkDeviceSize>(height_) * sizeof(float);
     QString error;
     soft_error_ = &error;
     destroy_buffer(staging_);
@@ -845,8 +867,12 @@ void LeniaRenderer::finish_capture() {
             range.size = VK_WHOLE_SIZE;
             df_->vkInvalidateMappedMemoryRanges(dev_, 1, &range);
         }
-        result.density = lenia::Grid(static_cast<std::size_t>(capture_width_), static_cast<std::size_t>(capture_height_));
-        std::memcpy(result.density.cells.data(), mapped, result.density.cells.size() * sizeof(float));
+        const auto w = static_cast<std::size_t>(capture_width_), h = static_cast<std::size_t>(capture_height_);
+        result.density = lenia::Grid(w, h);
+        result.nutrient = lenia::Grid(w, h);
+        const std::size_t plane = w * h * sizeof(float);
+        std::memcpy(result.density.cells.data(), mapped, plane);
+        std::memcpy(result.nutrient.cells.data(), static_cast<const char*>(mapped) + plane, plane);
         df_->vkUnmapMemory(dev_, staging_.memory);
         result.generation = capture_generation_;
         ++view_->readbacks_;
@@ -857,8 +883,11 @@ void LeniaRenderer::finish_capture() {
 
 void LeniaRenderer::record_uploads(VkCommandBuffer cb) {
     LeniaView::Pending& p = view_->pending_;
-    const bool any = clear_world_ || upload_palette_ || upload_twiddles_ || p.world || p.impulse || !p.pokes.empty();
+    const bool any = clear_world_ || upload_palette_ || upload_twiddles_ || p.world || p.nutrient || p.impulse ||
+                     !p.pokes.empty();
     if (!any) return;
+    // The density's size in bytes; the nutrient follows it in each cell buffer.
+    const VkDeviceSize plane = static_cast<VkDeviceSize>(width_) * static_cast<VkDeviceSize>(height_) * sizeof(float);
 
     constexpr VkPipelineStageFlags kShaders = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     constexpr VkAccessFlags kShaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -881,7 +910,7 @@ void LeniaRenderer::record_uploads(VkCommandBuffer cb) {
         cleared = true;
     }
     if (p.impulse) {
-        df_->vkCmdFillBuffer(cb, cells_[cur_].buffer, 0, VK_WHOLE_SIZE, 0);
+        df_->vkCmdFillBuffer(cb, cells_[cur_].buffer, 0, plane, 0); // the density only
         cleared = true;
     }
     if (cleared) transfer_to_transfer();
@@ -905,6 +934,13 @@ void LeniaRenderer::record_uploads(VkCommandBuffer cb) {
         p.world.reset();
         uploaded = true;
     }
+    if (p.nutrient) {
+        if (p.nutrient->cells.size() * sizeof(float) == plane) {
+            update(cb, cells_[cur_], plane, p.nutrient->cells.data(), plane);
+            uploaded = true;
+        }
+        p.nutrient.reset();
+    }
     if (p.impulse) {
         const std::uint32_t center = static_cast<std::uint32_t>((height_ / 2) * width_ + width_ / 2);
         const float one = 1.0f;
@@ -916,7 +952,7 @@ void LeniaRenderer::record_uploads(VkCommandBuffer cb) {
     // Phase 3: painted cells, coalesced into runs of consecutive indices.
     if (!p.pokes.empty()) {
         if (uploaded) transfer_to_transfer();
-        const std::uint32_t cell_count = static_cast<std::uint32_t>(width_ * height_);
+        const std::uint32_t cell_count = static_cast<std::uint32_t>(2 * width_ * height_); // both fields
         std::vector<float> run;
         for (auto it = p.pokes.begin(); it != p.pokes.end();) {
             const std::uint32_t start = it->first;
@@ -964,7 +1000,7 @@ void LeniaRenderer::record_steps(VkCommandBuffer cb) {
             break;
         }
         warned_bad_kernel_ = false;
-        if (in.rule && in.rule->ops.size() > lenia::kMaxRuleOps) {
+        if (in.rule && !valid_rule(*in.rule)) {
             if (!warned_bad_rule_) qWarning("LeniaView: rule program too large; not stepping");
             warned_bad_rule_ = true;
             break;
@@ -982,8 +1018,13 @@ void LeniaRenderer::record_steps(VkCommandBuffer cb) {
                 uploaded_kernel_ = in.kernel;
             }
             if (new_rule) {
-                const std::vector<std::uint32_t> words = lenia::pack_rule(*in.rule);
+                const std::vector<std::uint32_t> words = lenia::pack_rule(*in.rule, kRuleKernelBase);
                 update(cb, rule_, 0, words.data(), words.size() * sizeof(std::uint32_t));
+                const std::vector<float> kernels = lenia::pack_rule_kernels(*in.rule);
+                if (!kernels.empty()) {
+                    update(cb, kernel_, static_cast<VkDeviceSize>(kRuleKernelBase) * sizeof(float), kernels.data(),
+                           kernels.size() * sizeof(float));
+                }
                 uploaded_rule_ = in.rule;
             }
             barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1012,7 +1053,8 @@ void LeniaRenderer::record_steps(VkCommandBuffer cb) {
                           std::sin(env.angle),
                           env.offset,
                           in.rule ? 1u : 0u,
-                          used_fft ? 1u : 0u};
+                          used_fft ? 1u : 0u,
+                          in.rule ? in.preview : lenia::kNoRegister};
         df_->vkCmdPushConstants(cb, step_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         df_->vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, step_layout_, 0, 1, &step_sets_[cur_], 0,
                                      nullptr);
@@ -1119,6 +1161,7 @@ void LeniaView::upload_world(const lenia::Grid& world, std::uint64_t generation)
     world_width_ = static_cast<int>(world.width);
     world_height_ = static_cast<int>(world.height);
     pending_.world = world;
+    if (resized) pending_.nutrient.reset(); // sized for the old world; the new one starts at 0
     pending_.impulse = false;
     pending_.pokes.clear();
     pending_.steps = 0; // steps queued for the old world do not apply to this one
@@ -1126,6 +1169,19 @@ void LeniaView::upload_world(const lenia::Grid& world, std::uint64_t generation)
     emit generation_changed(generation_);
     if (resized) fit_view();
     requestUpdate();
+}
+
+void LeniaView::upload_world(const lenia::Grid& density, const lenia::Grid& nutrient, std::uint64_t generation) {
+    if (nutrient.width != density.width || nutrient.height != density.height ||
+        nutrient.cells.size() != density.cells.size()) {
+        qWarning("upload_world: nutrient of another size ignored");
+        upload_world(density, generation);
+        return;
+    }
+    upload_world(density, generation);
+    if (static_cast<int>(density.width) == world_width_ && static_cast<int>(density.height) == world_height_) {
+        pending_.nutrient = nutrient;
+    }
 }
 
 void LeniaView::capture_world(CaptureCallback done) {
@@ -1233,7 +1289,8 @@ void LeniaView::paint_disk(int cx, int cy, float value) {
             if (dx * dx + dy * dy > r * r) continue;
             const int x = ((cx + dx) % world_width_ + world_width_) % world_width_;
             const int y = ((cy + dy) % world_height_ + world_height_) % world_height_;
-            pending_.pokes[static_cast<std::uint32_t>(y * world_width_ + x)] = value;
+            const int base = brush_field_ == BrushField::Nutrient ? world_width_ * world_height_ : 0;
+            pending_.pokes[static_cast<std::uint32_t>(base + y * world_width_ + x)] = value;
         }
     }
 }
@@ -1253,7 +1310,12 @@ void LeniaView::paint_line(QPointF from, QPointF to, float value) {
 
 void LeniaView::mousePressEvent(QMouseEvent* e) {
     last_mouse_ = e->position();
-    if (e->button() == Qt::LeftButton) {
+    if (e->button() == Qt::LeftButton && (e->modifiers() & Qt::AltModifier)) {
+        const QPointF cell = to_cell(e->position());
+        const int x = static_cast<int>(std::floor(cell.x()));
+        const int y = static_cast<int>(std::floor(cell.y()));
+        if (x >= 0 && y >= 0 && x < world_width_ && y < world_height_) emit cell_probed(x, y);
+    } else if (e->button() == Qt::LeftButton) {
         drag_ = Drag::Paint;
         drag_value_ = (e->modifiers() & Qt::ShiftModifier) ? 0.0f : brush_value_;
         last_cell_ = to_cell(e->position());

@@ -9,6 +9,7 @@ separate: they store the setup only and restart at generation 0.
 |--------------------------|--------------------------------|-----------------------|
 | Kernel, growth, graphs, display, seed | yes               | yes (an experiment, embedded unchanged) |
 | World density            | no (rebuilt from the seed)     | yes, every cell bit for bit |
+| World nutrient (`state_fields.md`) | no (rebuilt from `[nutrient]`) | yes, every cell bit for bit (version 2) |
 | Generation               | no (opens at 0)                | yes |
 | Hand-painted cells       | no                             | yes (they are part of the density) |
 
@@ -56,28 +57,34 @@ Saving writes through `QSaveFile` (a temporary file renamed over the target once
 a failed save leaves an existing file intact, and the workbench parses its own output again
 before writing and refuses to save anything it could not reopen.
 
-## Format, version 1
+## Format, version 2
 
 A short text header, then binary data; lines end with `\n` only, and the file must not be
 edited (the checksum fails).
 
 ```
-lenia-snapshot 1
+lenia-snapshot 2
 # Lenia workbench simulation snapshot (docs/snapshots.md); binary data follows, do not edit
 generation 1234
 experiment <N>
 <N bytes: the experiment exactly as a .leniaexp file holds it (projects.md)>
 density <W> <H> f32le
 <W × H × 4 bytes: rows top first, each cell an IEEE 754 float32, little-endian>
+nutrient <W> <H> f32le
+<W × H × 4 bytes, the same layout>
 
 checksum fnv1a64 <16 lowercase hex digits>
 ```
 
+Version 1 has no nutrient block. Opening one gives the nutrient its experiment's starting field
+(a uniform 1 for every experiment before version 4), which nothing in its graph reads, so it
+continues exactly as before.
+
 - `generation`: 0 to 2⁶⁴ − 1, the generation the density is at (the next step computes
   `generation + 1`).
-- `W` and `H` must equal the experiment's world size; cells may be any finite value (rules can
-  leave [0, 1]); NaN and infinities are rejected.
-- The density is followed by a `\n`; `checksum` is 64-bit FNV-1a over every byte before the
+- `W` and `H` of both fields must equal the experiment's world size; cells may be any finite
+  value (rules can leave [0, 1]); NaN and infinities are rejected.
+- Each field is followed by a `\n`; `checksum` is 64-bit FNV-1a over every byte before the
   checksum line. Nothing may follow it. Lines starting with `#` are comments in the header.
 
 `kSnapshotVersion` is the version written; a build reads every version up to its own and
@@ -96,6 +103,9 @@ experiment format changes need no new snapshot version.
   rendered viewport (`QVulkanWindow::grab`) changes while generation and density stay
   bit-identical, saves a snapshot, refuses a damaged one without touching the world, reopens
   the snapshot while running (paused at its generation) and steps it to the original run's
-  result bit for bit, and checks that playback performs no readbacks. It needs a desktop
+  result bit for bit, and checks that playback performs no readbacks. It then runs the nutrient
+  trail demo, compares a GPU generation of both fields with the CPU, and reopens a two-field
+  snapshot bit for bit. `tests/test_state_fields.cpp` covers two-field roundtrips and version 1
+  files. It needs a desktop
   session; without a Vulkan device it reports skipped (77). Run it with
   `ctest -C Release -L gui --output-on-failure`.

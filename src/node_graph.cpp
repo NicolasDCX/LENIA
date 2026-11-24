@@ -77,8 +77,13 @@ std::vector<NodeSpec> build_specs() {
                  "static kernel. Next state = the per-cell rule's result; unlinked, the built-in Lenia "
                  "update clamp(A + dt × (G(U) + environment), 0, 1) runs with the Simulation panel's growth "
                  "and the Environment linked here (unlinked = none). A linked rule ignores the Environment "
-                 "input: wire the Environment's Field into the rule instead.",
-                 {{"Kernel", T::Kernel}, {"Environment", T::Environment}, {"Next state", T::Cell}},
+                 "input: wire the Environment's Field into the rule instead. Next nutrient = the nutrient "
+                 "field's next value, computed from the same current state as Next state (both update "
+                 "together); unlinked, the nutrient stays as it is. It needs Next state linked too.",
+                 {{"Kernel", T::Kernel},
+                  {"Environment", T::Environment},
+                  {"Next state", T::Cell},
+                  {"Next nutrient", T::Cell}},
                  {},
                  {}});
 
@@ -86,9 +91,9 @@ std::vector<NodeSpec> build_specs() {
     s.push_back({NodeKind::Density,
                  "Density A",
                  "The cell's current state A, as shown in the Density view: in [0, 1] for Lenia, 0 or 1 "
-                 "for the Game of Life.",
+                 "for the Game of Life. The Field output is the whole density, for a Convolve node.",
                  {},
-                 {{"A", T::Cell}},
+                 {{"A", T::Cell}, {"Field", T::Field}},
                  {}});
     s.push_back({NodeKind::Neighborhood,
                  "Neighborhood U",
@@ -163,10 +168,10 @@ std::vector<NodeSpec> build_specs() {
     // Display nodes.
     s.push_back({NodeKind::Fields,
                  "Fields",
-                 "The simulation fields at each cell: density A, neighborhood U and growth, exactly what the "
-                 "panel's Field choice shows (Growth: the rule's first Growth node, or next − current).",
+                 "The simulation fields at each cell: density A, neighborhood U, growth and nutrient N, exactly "
+                 "what the panel's Field choice shows (Growth: the rule's first Growth node, or next − current).",
                  {},
-                 {{"Density A", T::Cell}, {"Neighborhood U", T::Cell}, {"Growth", T::Cell}},
+                 {{"Density A", T::Cell}, {"Neighborhood U", T::Cell}, {"Growth", T::Cell}, {"Nutrient N", T::Cell}},
                  {}});
     {
         NodeSpec ramp{NodeKind::ColorRamp,
@@ -213,6 +218,49 @@ std::vector<NodeSpec> build_specs() {
                  "display graphs existed.",
                  {{"Color", T::Color, -1}},
                  {},
+                 {}});
+
+    // The second state field.
+    s.push_back({NodeKind::Nutrient,
+                 "Nutrient N",
+                 "The cell's current nutrient N, the second state field (Nutrient view). Read it to make "
+                 "growth depend on it; write its next value through the Simulation node's Next nutrient. "
+                 "Every cell's next A and next N come from the same current A, N and U. The Field output is "
+                 "the whole nutrient, for a Convolve node.",
+                 {},
+                 {{"N", T::Cell}, {"Field", T::Field}},
+                 {}});
+
+    // Reusable convolution kernels.
+    {
+        NodeSpec k{NodeKind::ConvKernel,
+                   "Kernel K",
+                   "A kernel of its own, independent of the Kernel panel, for Convolve nodes (link it into "
+                   "several to reuse it). Rings of the chosen core within Radius, weights innermost first, then "
+                   "normalized. Shift moves where a cell looks: with Shift X = 3 a cell gathers the field around "
+                   "the point 3 cells to its right (+Y is down), making the kernel asymmetric. The kernel grid "
+                   "is at most 65 × 65 cells: Radius + the larger shift ≤ 32.",
+                   {},
+                   {{"K", T::ConvKernel}},
+                   {{"Radius (cells)", 1.0f, static_cast<float>(conv_kernel_node::kMaxRadius), 8.0f, 1.0f, 0, {}},
+                    {"Core", 0.0f, 3.0f, 0.0f, 1.0f, 0, {"Exponential bump", "Polynomial", "Step", "Gaussian bell"}},
+                    {"Rings", 1.0f, static_cast<float>(conv_kernel_node::kMaxRings), 1.0f, 1.0f, 0, {}},
+                    {"Ring 1 weight", -1.0f, 1.0f, 1.0f, 0.05f, 3, {}},
+                    {"Ring 2 weight", -1.0f, 1.0f, 0.5f, 0.05f, 3, {}},
+                    {"Ring 3 weight", -1.0f, 1.0f, 0.25f, 0.05f, 3, {}},
+                    {"Normalization", 0.0f, 3.0f, 1.0f, 1.0f, 0, {"None (raw)", "Sum = 1", "Positive = 1", "|Sum| = 1"}},
+                    {"Shift X (cells)", -16.0f, 16.0f, 0.0f, 0.5f, 2, {}},
+                    {"Shift Y (cells)", -16.0f, 16.0f, 0.0f, 0.5f, 2, {}}}};
+        s.push_back(std::move(k));
+    }
+    s.push_back({NodeKind::Convolve,
+                 "Convolve",
+                 "U = K ∗ field per cell: the state field linked into Field (a Density A or Nutrient N node's "
+                 "Field output; unlinked = the density) weighted by the Kernel K linked into Kernel, around "
+                 "each cell (the world wraps). Several Convolve nodes give a rule several neighborhoods, e.g. a "
+                 "short and a long range. Select the node to preview its U in the view's Neighborhood field.",
+                 {{"Field", T::Field, -1}, {"Kernel", T::ConvKernel, -1}},
+                 {{"U", T::Cell}},
                  {}});
     return s;
 }
@@ -270,8 +318,9 @@ const NodeSpec& node_spec(NodeKind kind) { return specs()[static_cast<std::size_
 
 const std::vector<NodeKind>& node_kinds() {
     static const std::vector<NodeKind> k = {
-        NodeKind::Time,     NodeKind::Oscillator, NodeKind::Constant,     NodeKind::Kernel,
-        NodeKind::Environment, NodeKind::Output,  NodeKind::Density,      NodeKind::Neighborhood,
+        NodeKind::Time,     NodeKind::Oscillator, NodeKind::Constant,     NodeKind::Kernel,       NodeKind::ConvKernel,
+        NodeKind::Environment, NodeKind::Output,  NodeKind::Density,      NodeKind::Nutrient, NodeKind::Neighborhood,
+        NodeKind::Convolve,
         NodeKind::Growth,   NodeKind::Add,        NodeKind::Multiply,     NodeKind::Clamp,
         NodeKind::Compare,  NodeKind::Select,     NodeKind::Life,         NodeKind::Fields,
         NodeKind::ColorRamp, NodeKind::Color,     NodeKind::Mix,          NodeKind::View};
@@ -546,6 +595,33 @@ Environment node_environment(const Graph& graph, int node, std::uint64_t generat
     return e;
 }
 
+ConvKernel node_conv_kernel(const Graph& graph, int node) {
+    ConvKernel k;
+    const Node* n = graph.node(node);
+    if (!n || n->kind != NodeKind::ConvKernel) return k;
+    using namespace conv_kernel_node;
+    const auto p = [&](int i) { return n->params[static_cast<std::size_t>(i)]; };
+    k.shape.radius = static_cast<int>(p(Radius));
+    k.shape.core = static_cast<KernelCore>(static_cast<int>(p(Core)));
+    k.shape.rings.clear();
+    for (int r = 0; r < static_cast<int>(p(Rings)); ++r) k.shape.rings.push_back(p(Ring1 + r));
+    k.normalization = static_cast<KernelNormalization>(static_cast<int>(p(Normalization)));
+    k.shift_x = p(ShiftX);
+    k.shift_y = p(ShiftY);
+    return k;
+}
+
+Grid make_conv_kernel(const ConvKernel& kernel) {
+    const double half =
+        std::ceil(kernel.shape.radius + std::max(std::fabs(kernel.shift_x), std::fabs(kernel.shift_y)) - 1e-9);
+    if (!(half <= conv_kernel_node::kMaxHalfSize)) {
+        throw std::invalid_argument("radius " + std::to_string(kernel.shape.radius) +
+                                    " plus the shift exceeds the " + std::to_string(conv_kernel_node::kMaxHalfSize) +
+                                    "-cell limit (at most 65 x 65 weights)");
+    }
+    return normalize_kernel(make_kernel(kernel.shape, kernel.shift_x, kernel.shift_y), kernel.normalization);
+}
+
 GraphFrame evaluate(const Graph& graph, std::uint64_t generation) {
     GraphFrame f;
     const int out = graph.output_node();
@@ -559,6 +635,7 @@ GraphFrame evaluate(const Graph& graph, std::uint64_t generation) {
         f.environment = node_environment(graph, l->from_node, generation);
     }
     f.rule_connected = graph.link_into(out, output_node::NextIn) != nullptr;
+    f.nutrient_connected = graph.link_into(out, output_node::NutrientIn) != nullptr;
     return f;
 }
 
@@ -658,6 +735,102 @@ Graph make_preset(GraphPreset preset) {
         g.connect(select, 0, out, output_node::NextIn);
         return g;
     }
+    if (preset == GraphPreset::NutrientTrail) {
+        // Density row: clamp(A + dt × (G(U) + starvation × (N − 1)), 0, 1). At N = 1 the
+        // starvation term is exactly 0, so this is wire_lenia_rule's update bit for bit.
+        const int neighborhood = g.add_node(NodeKind::Neighborhood, 20, 0);
+        const int density = g.add_node(NodeKind::Density, 20, 110);
+        const int nutrient = g.add_node(NodeKind::Nutrient, 20, 330);
+        const int growth = g.add_node(NodeKind::Growth, 250, -20); // Source = Simulation panel
+        g.connect(neighborhood, 0, growth, growth_node::UIn);
+        const int deficit = g.add_node(NodeKind::Add, 250, 200); // N − 1
+        g.connect(nutrient, 0, deficit, add_node::A);
+        g.set_param(deficit, add_node::B, -1.0f);
+        const int starve = g.add_node(NodeKind::Multiply, 480, 200);
+        g.connect(deficit, 0, starve, multiply_node::A);
+        g.set_param(starve, multiply_node::B, kTrailStarvation);
+        const int rate = g.add_node(NodeKind::Add, 710, 0);
+        g.connect(growth, growth_node::GOut, rate, add_node::A);
+        g.connect(starve, 0, rate, add_node::B);
+        const int scaled = g.add_node(NodeKind::Multiply, 940, 0);
+        g.connect(rate, 0, scaled, multiply_node::A);
+        g.connect(growth, growth_node::DtOut, scaled, multiply_node::B);
+        const int next = g.add_node(NodeKind::Add, 1170, 60);
+        g.connect(density, 0, next, add_node::A);
+        g.connect(scaled, 0, next, add_node::B);
+        const int clamp = g.add_node(NodeKind::Clamp, 1400, 60);
+        g.connect(next, 0, clamp, clamp_node::X);
+
+        // Nutrient row: clamp(N + recovery × (1 − N) − uptake × A × N, 0, 1).
+        const int eaten = g.add_node(NodeKind::Multiply, 250, 420); // A × N
+        g.connect(density, 0, eaten, multiply_node::A);
+        g.connect(nutrient, 0, eaten, multiply_node::B);
+        const int uptake = g.add_node(NodeKind::Multiply, 480, 420); // − uptake × A × N
+        g.connect(eaten, 0, uptake, multiply_node::A);
+        g.set_param(uptake, multiply_node::B, -kTrailUptake);
+        const int lost = g.add_node(NodeKind::Multiply, 250, 580); // − recovery × N
+        g.connect(nutrient, 0, lost, multiply_node::A);
+        g.set_param(lost, multiply_node::B, -kTrailRecovery);
+        const int recovery = g.add_node(NodeKind::Add, 480, 580); // recovery × (1 − N)
+        g.connect(lost, 0, recovery, add_node::A);
+        g.set_param(recovery, add_node::B, kTrailRecovery);
+        const int regrown = g.add_node(NodeKind::Add, 710, 480);
+        g.connect(nutrient, 0, regrown, add_node::A);
+        g.connect(recovery, 0, regrown, add_node::B);
+        const int consumed = g.add_node(NodeKind::Add, 940, 480);
+        g.connect(regrown, 0, consumed, add_node::A);
+        g.connect(uptake, 0, consumed, add_node::B);
+        const int nutrient_clamp = g.add_node(NodeKind::Clamp, 1170, 480);
+        g.connect(consumed, 0, nutrient_clamp, clamp_node::X);
+
+        const int out = g.add_node(NodeKind::Output, 1630, 220);
+        g.connect(clamp, 0, out, output_node::NextIn);
+        g.connect(nutrient_clamp, 0, out, output_node::NutrientIn);
+        return g;
+    }
+    if (preset == GraphPreset::ShortLongRange) {
+        // next A = clamp(A + (S > w × L ? dt : −dt), 0, 1), S and L the two Convolve outputs.
+        const int density = g.add_node(NodeKind::Density, 20, 0);
+        const auto kernel = [&](int radius, float y) {
+            using namespace conv_kernel_node;
+            const int k = g.add_node(NodeKind::ConvKernel, 20, y);
+            g.set_param(k, Radius, static_cast<float>(radius));
+            g.set_param(k, Core, static_cast<float>(KernelCore::GaussianBell));
+            g.set_param(k, Rings, 1.0f);
+            g.set_param(k, Ring1, 1.0f);
+            g.set_param(k, Normalization, static_cast<float>(KernelNormalization::Sum));
+            return k;
+        };
+        const int near_kernel = kernel(kShortRadius, 110);
+        const int far_kernel = kernel(kLongRadius, 290);
+        const auto convolve = [&](int k, float y) {
+            const int c = g.add_node(NodeKind::Convolve, 270, y);
+            g.connect(density, field_node::FieldOut, c, convolve_node::FieldIn);
+            g.connect(k, 0, c, convolve_node::KernelIn);
+            return c;
+        };
+        const int near_u = convolve(near_kernel, 110);
+        const int far_u = convolve(far_kernel, 290);
+        const int weighted = g.add_node(NodeKind::Multiply, 500, 290); // w × L
+        g.connect(far_u, 0, weighted, multiply_node::A);
+        g.set_param(weighted, multiply_node::B, kLongWeight);
+        const int wins = g.add_node(NodeKind::Compare, 730, 130); // S > w × L
+        g.set_param(wins, compare_node::Op, static_cast<float>(CompareOp::Greater));
+        g.connect(near_u, 0, wins, compare_node::AIn);
+        g.connect(weighted, 0, wins, compare_node::BIn);
+        const int rate = g.add_node(NodeKind::Select, 960, 130); // ± dt
+        g.connect(wins, 0, rate, select_node::Condition);
+        g.set_param(rate, select_node::IfTrue, kShortLongDt);
+        g.set_param(rate, select_node::IfFalse, -kShortLongDt);
+        const int next = g.add_node(NodeKind::Add, 1190, 30);
+        g.connect(density, field_node::ValueOut, next, add_node::A);
+        g.connect(rate, 0, next, add_node::B);
+        const int clamp = g.add_node(NodeKind::Clamp, 1420, 30); // Low 0, High 1 by default
+        g.connect(next, 0, clamp, clamp_node::X);
+        const int out = g.add_node(NodeKind::Output, 1650, 0);
+        g.connect(clamp, 0, out, output_node::NextIn);
+        return g;
+    }
 
     const int time = g.add_node(NodeKind::Time, 20, 60);
     const int osc = g.add_node(NodeKind::Oscillator, 250, 0);
@@ -704,6 +877,8 @@ Graph make_preset(GraphPreset preset) {
     }
     case GraphPreset::GameOfLife:
     case GraphPreset::GameOfLifeCompare:
+    case GraphPreset::NutrientTrail:
+    case GraphPreset::ShortLongRange:
         break; // built above
     }
     wire_lenia_rule(g, 20, 480);
@@ -730,6 +905,23 @@ Grid step_graph(const Grid& world, const Graph& graph, const Grid& kernel, const
         return step_rule(world, kernel, rule.program);
     }
     return step_lenia(world, kernel, growth, f.environment_connected ? f.environment : Environment{});
+}
+
+WorldState step_graph(const WorldState& world, const Graph& graph, const KernelShape& shape,
+                      const GrowthParams& growth, std::uint64_t generation) {
+    return step_graph(world, graph, graph_kernel(graph, shape, generation), growth, generation);
+}
+
+WorldState step_graph(const WorldState& world, const Graph& graph, const Grid& kernel, const GrowthParams& growth,
+                      std::uint64_t generation) {
+    const GraphFrame f = evaluate(graph, generation);
+    if (f.rule_connected || f.nutrient_connected) {
+        const RuleCompile rule = compile_rule(graph, generation, growth);
+        if (!rule.error.empty()) throw std::invalid_argument(rule.error);
+        return step_rule(world, kernel, rule.program);
+    }
+    return {step_lenia(world.density, kernel, growth, f.environment_connected ? f.environment : Environment{}),
+            world.nutrient};
 }
 
 } // namespace lenia

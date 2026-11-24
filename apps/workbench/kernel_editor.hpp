@@ -75,16 +75,22 @@ public:
     explicit RingProfileWidget(KernelModel* model, QWidget* parent = nullptr);
     QSize sizeHint() const override { return {320, 160}; }
 
+signals:
+    // A drag ended (button released): one undo step (docs/undo.md).
+    void edited(const QString& text);
+
 protected:
     void paintEvent(QPaintEvent*) override;
     void mousePressEvent(QMouseEvent* e) override;
     void mouseMoveEvent(QMouseEvent* e) override;
+    void mouseReleaseEvent(QMouseEvent* e) override;
 
 private:
     QRectF plot_rect() const;
     void edit(QPointF pos, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
 
     KernelModel* model_;
+    bool editing_ = false; // a drag is setting ring weights
 };
 
 // Kernel cells drawn with a signed palette (raw weights, -1 blue .. +1 red). Left drag adds
@@ -99,10 +105,15 @@ public:
 
     void set_brush(double radius, float strength, bool rings);
 
+signals:
+    // A stroke ended (button released): one undo step however many dabs it painted.
+    void edited(const QString& text);
+
 protected:
     void paintEvent(QPaintEvent*) override;
     void mousePressEvent(QMouseEvent* e) override;
     void mouseMoveEvent(QMouseEvent* e) override;
+    void mouseReleaseEvent(QMouseEvent* e) override;
 
 private:
     QRectF grid_rect() const;
@@ -113,6 +124,8 @@ private:
     float strength_ = 0.1f;
     bool rings_ = false;
     QPointF hover_{-1, -1};
+    bool erasing_ = false; // the stroke in progress erases (named in its undo step)
+    bool stroking_ = false;
 };
 
 } // namespace workbench
